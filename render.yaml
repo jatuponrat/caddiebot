@@ -1,0 +1,30 @@
+# Render Blueprint — deploy the Caddiebot webhook as a free web service.
+# In Render: New + → Blueprint → pick this repo. Render reads this file.
+# You'll be asked to fill the two LINE secrets (they are NOT stored in git).
+services:
+  - type: web
+    name: caddiebot
+    runtime: node
+    plan: free
+    region: singapore # closest to Thailand; change if you like
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: LINE_CHANNEL_SECRET
+        sync: false # prompted in the Render dashboard
+      - key: LINE_CHANNEL_ACCESS_TOKEN
+        sync: false
+# NOTE: state is in-memory for now, so it resets when the free service sleeps
+# (~15 min idle) or redeploys. When you want persistence, add a Postgres here:
+#
+# databases:
+#   - name: caddiebot-db
+#     plan: free
+#     databaseName: caddiebot
+# and add to envVars:
+#       - key: DATABASE_URL
+#         fromDatabase:
+#           name: caddiebot-db
+#           property: connectionString
