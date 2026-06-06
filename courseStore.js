@@ -24,7 +24,7 @@ export function findCustomCourse(name) {
   if (custom.has(k)) return { ok: true, ...custom.get(k) };
   // allow a typed name to contain the saved key (e.g. "kbsc golf" -> "kbsc")
   for (const [ck, v] of custom) {
-    if (ck.length >= 3 && (k === ck || k.includes(ck))) return { ok: true, ...v };
+    if (ck.length >= 3 && (k === ck || k.startsWith(ck))) return { ok: true, ...v };
   }
   return null;
 }

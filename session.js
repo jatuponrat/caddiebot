@@ -411,7 +411,7 @@ function handleSetupAnswer(text, sourceId, store, game) {
         total_par: pp.total,
         message:
           `สนาม ${m[1]} — พาร์รวม ${pp.total} (OUT ${pp.out} / IN ${pp.in})\n` +
-          `ยืนยันไหมครับ? (พิมพ์ ยืนยัน / แก้ไข)`,
+          `ครบพาร์ ${pp.total} ถูกต้องไหมครับ? (พิมพ์ ยืนยัน / แก้ไข)`,
       };
       return env;
     }
@@ -424,23 +424,51 @@ function handleSetupAnswer(text, sourceId, store, game) {
       };
       return env;
     }
-    // (c) ชื่อเฉย ๆ -> สนามสำเร็จรูป / คลังสนามที่เคยบันทึก / ค่อยกรอกพาร์ทีหลัง
+    // (c) ชื่อเฉย ๆ -> สนามสำเร็จรูป/คลัง (โหลดเลย) หรือ ไม่พบ -> ขอกรอกพาร์เอง
     const found = lookupPresetCourse(t) || findCustomCourse(t);
-    const r = store.setCourseName(sourceId, t);
-    let line;
     if (found && found.ok) {
+      const r = store.setCourseName(sourceId, t);
       store.setCourse(null, sourceId, { name: r.game.course_name, holes: found.holes });
       env.course = r.game.course;
-      line = `สนาม ${r.game.course_name} ✅ โหลดพาร์ ${found.total} ให้อัตโนมัติ`;
-    } else {
-      line = `สนาม ${r.game.course_name} ✅ (ยังไม่มีพาร์ — พิมพ์ “ชื่อ + พาร์ 18 หลุม” เพื่อบันทึก เช่น “Kbsc 454435434 435444354”)`;
+      env.summary = {
+        ok: true,
+        step: "stake",
+        course_name: r.game.course_name,
+        par_loaded: true,
+        message: `สนาม ${r.game.course_name} ✅ โหลดพาร์ ${found.total} ให้อัตโนมัติ\nเล่นกันหลุมละเท่าไรครับ? (พิมพ์ตัวเลข เช่น 20)`,
+      };
+      return env;
     }
+    const r = store.awaitPars(sourceId, t);
     env.summary = {
       ok: true,
-      step: "stake",
+      step: "await_pars",
       course_name: r.game.course_name,
-      par_loaded: Boolean(found && found.ok),
-      message: `${line}\nเล่นกันหลุมละเท่าไรครับ? (พิมพ์ตัวเลข เช่น 20)`,
+      par_loaded: false,
+      message: `ไม่พบสนาม “${r.game.course_name}” — กรอกพาร์ 18 หลุมด้วยครับ\nเช่น “454354434 443535444” (9+9 หลุม)`,
+    };
+    return env;
+  }
+
+  if (game.setup === "await_pars") {
+    const pp = parseParString(t);
+    if (!pp.ok) {
+      env.summary = {
+        ok: false,
+        step: "await_pars",
+        message: "พาร์ต้องเป็นเลข 3–6 ครบ 18 หลุม — กรอกใหม่ เช่น “454354434 443535444”",
+      };
+      return env;
+    }
+    store.setPendingCourse(sourceId, game.course_name, pp.holes, pp.total);
+    env.summary = {
+      ok: true,
+      step: "confirm_course",
+      course_name: game.course_name,
+      total_par: pp.total,
+      message:
+        `สนาม ${game.course_name} — พาร์รวม ${pp.total} (OUT ${pp.out} / IN ${pp.in})\n` +
+        `ครบพาร์ ${pp.total} ถูกต้องไหมครับ? (พิมพ์ ยืนยัน / แก้ไข)`,
     };
     return env;
   }
@@ -466,8 +494,8 @@ function handleSetupAnswer(text, sourceId, store, game) {
       store.editCourse(sourceId);
       env.summary = {
         ok: true,
-        step: "course",
-        message: "ได้ครับ พิมพ์ชื่อสนามใหม่ หรือ “ชื่อ + พาร์ 18 หลุม” อีกครั้ง",
+        step: "await_pars",
+        message: "ได้ครับ กรอกพาร์สนามใหม่อีกครั้ง เช่น “454354434 443535444”",
       };
       return env;
     }

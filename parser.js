@@ -118,7 +118,7 @@ export function lookupPresetCourse(name) {
   for (const c of PRESET_COURSES) {
     const hit = c.aliases.some((a) => {
       const aa = a.toLowerCase().replace(/\s+/g, "");
-      return aa.length >= 3 && (key === aa || key.includes(aa));
+      return aa.length >= 3 && (key === aa || key.startsWith(aa));
     });
     if (hit) return { ...parseParString(c.pars), preset: c.aliases[0] };
   }

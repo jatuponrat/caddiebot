@@ -125,6 +125,15 @@ export class GameStore {
     return { ok: true, game };
   }
 
+  /** Course name not found — keep the name and wait for the user to type the pars. */
+  awaitPars(sourceId, name) {
+    const game = this._resolve(null, sourceId);
+    if (!game) return { ok: false, error: "no active game" };
+    game.course_name = String(name || "").trim() || null;
+    game.setup = "await_pars";
+    return { ok: true, game };
+  }
+
   /** Stash a name+par course awaiting the user's "ยืนยัน". */
   setPendingCourse(sourceId, name, holes, total) {
     const game = this._resolve(null, sourceId);
@@ -147,12 +156,12 @@ export class GameStore {
     return { ok: true, game, total };
   }
 
-  /** Discard the pending course and ask for the name again. */
+  /** Discard the pending course and ask for the pars again (keep the name). */
   editCourse(sourceId) {
     const game = this._resolve(null, sourceId);
     if (!game) return { ok: false, error: "no active game" };
     game.pending_course = null;
-    game.setup = "course";
+    game.setup = "await_pars";
     return { ok: true, game };
   }
 
