@@ -13,6 +13,8 @@ import {
   lookupPresetCourse,
 } from "./parser.js";
 import { settleHole, settleGame } from "./engine.js";
+import { findCustomCourse, rememberCourse } from "./courseStore.js";
+import { saveRound } from "./db.js";
 import { emptyEnvelope } from "./handler.js";
 
 /** "A +40, B −20, C 0" — format a {name: amount} money map for chat. */
@@ -52,7 +54,7 @@ const WELCOME_TH =
   "พิมพ์ “สร้างเกม 4 คน” เพื่อเริ่ม\n" +
   "กรอกพาร์สนาม: “454354434 443535444”\n" +
   "เข้าร่วม: “เข้าร่วม แซม 105 90 91”\n" +
-  "ลงแต้ม: “หลุม 1 A 5 B 6 C 5 D 7”\n" +
+  "ลงแต้ม: “หลุม 1 A 5 B 6” หรือ “H1 แซม 4”\n" +
   "สรุปเงิน: “รวม 18” · จบเกม: “จบเกม”";
 
 export function welcomeMessage() {
@@ -80,17 +82,15 @@ export function dispatch(text, sourceId, store) {
 
   // Guided setup: while a game is mid-setup, free-text replies are the answers.
   const pending = store.pendingSetup(sourceId);
-  if (pending && intent === "unknown") {
-    return handleSetupAnswer(raw, sourceId, store, pending);
-  }
-  // Real gameplay starting? End any leftover setup so later chat isn't captured.
+  // While mid-setup, answers (incl. "ชื่อ + พาร์" which looks like bulk/par) go to setup.
   if (
     pending &&
-    (intent === "join" ||
-      intent === "hole_scores" ||
-      intent === "par_string" ||
-      intent === "bulk_scores")
+    (intent === "unknown" || intent === "bulk_scores" || intent === "par_string")
   ) {
+    return handleSetupAnswer(raw, sourceId, store, pending);
+  }
+  // Real gameplay (join/score) — end any leftover setup so later chat isn't captured.
+  if (pending && (intent === "join" || intent === "hole_scores")) {
     store.finishSetup(sourceId);
   }
 
@@ -140,6 +140,17 @@ export function dispatch(text, sourceId, store) {
         `สนาม ${g.course_name || "-"} · ผู้เล่น: ${names} · ${holesPlayed}/18 หลุม` +
         settleLine,
     };
+    // persist the round for history (no-op if DB disabled)
+    saveRound({
+      room_code: g.room_code,
+      source_id: sourceId,
+      course_name: g.course_name,
+      stake: g.stake,
+      turbo: g.turbo,
+      players: g.players,
+      holes: g.holes,
+      settlement: s.perPlayer,
+    }).catch(() => {});
     store.cancelGame(sourceId);
     return env;
   }
@@ -380,23 +391,87 @@ function handleSetupAnswer(text, sourceId, store, game) {
   const t = String(text).trim();
 
   if (game.setup === "course") {
-    const preset = lookupPresetCourse(t);
+    // (a) "ชื่อ + พาร์ 18 หลุม" เช่น "Kbsc 454435434 435444354"
+    const m = t.match(/^(\S+)\s+([\d\s]{10,})$/);
+    if (m) {
+      const pp = parseParString(m[2]);
+      if (!pp.ok) {
+        env.summary = {
+          ok: false,
+          step: "course",
+          message: "พาร์ต้องเป็นเลข 3–6 ครบ 18 หลุม เช่น “Kbsc 454435434 435444354”",
+        };
+        return env;
+      }
+      store.setPendingCourse(sourceId, m[1], pp.holes, pp.total);
+      env.summary = {
+        ok: true,
+        step: "confirm_course",
+        course_name: m[1],
+        total_par: pp.total,
+        message:
+          `สนาม ${m[1]} — พาร์รวม ${pp.total} (OUT ${pp.out} / IN ${pp.in})\n` +
+          `ยืนยันไหมครับ? (พิมพ์ ยืนยัน / แก้ไข)`,
+      };
+      return env;
+    }
+    // (b) พาร์ล้วนไม่มีชื่อ -> ขอชื่อ
+    if (/^[\d\s]{10,}$/.test(t) && parseParString(t).ok) {
+      env.summary = {
+        ok: false,
+        step: "course",
+        message: "ใส่ชื่อสนามด้วยครับ เช่น “Kbsc 454435434 435444354”",
+      };
+      return env;
+    }
+    // (c) ชื่อเฉย ๆ -> สนามสำเร็จรูป / คลังสนามที่เคยบันทึก / ค่อยกรอกพาร์ทีหลัง
+    const found = lookupPresetCourse(t) || findCustomCourse(t);
     const r = store.setCourseName(sourceId, t);
     let line;
-    if (preset && preset.ok) {
-      store.setCourse(null, sourceId, { name: r.game.course_name, holes: preset.holes });
+    if (found && found.ok) {
+      store.setCourse(null, sourceId, { name: r.game.course_name, holes: found.holes });
       env.course = r.game.course;
-      line = `สนาม ${r.game.course_name} ✅ โหลดพาร์ ${preset.total} ให้อัตโนมัติ`;
+      line = `สนาม ${r.game.course_name} ✅ โหลดพาร์ ${found.total} ให้อัตโนมัติ`;
     } else {
-      line = `สนาม ${r.game.course_name} ✅ (ไม่มีพาร์สำเร็จรูป เดี๋ยวกรอกพาร์เองทีหลัง เช่น “454354434 443535444”)`;
+      line = `สนาม ${r.game.course_name} ✅ (ยังไม่มีพาร์ — พิมพ์ “ชื่อ + พาร์ 18 หลุม” เพื่อบันทึก เช่น “Kbsc 454435434 435444354”)`;
     }
     env.summary = {
       ok: true,
       step: "stake",
       course_name: r.game.course_name,
-      par_loaded: Boolean(preset && preset.ok),
+      par_loaded: Boolean(found && found.ok),
       message: `${line}\nเล่นกันหลุมละเท่าไรครับ? (พิมพ์ตัวเลข เช่น 20)`,
     };
+    return env;
+  }
+
+  if (game.setup === "confirm_course") {
+    const yes = /ยืนยัน|ใช่|ตกลง|โอเค|^ok$|yes|^y$/i.test(t);
+    const no = /แก้ไข|ไม่|ใหม่|\bno\b|^n$/i.test(t);
+    if (yes && !no) {
+      const r = store.confirmCourse(sourceId);
+      // remember in the course library so the name loads the pars next time
+      rememberCourse(r.game.course_name, r.game.course.holes, r.total);
+      env.course = r.game.course;
+      env.summary = {
+        ok: true,
+        step: "stake",
+        course_name: r.game.course_name,
+        total_par: r.total,
+        message: `บันทึกสนาม ${r.game.course_name} (พาร์ ${r.total}) ✅ (จำไว้ใช้ครั้งหน้าได้เลย)\nเล่นกันหลุมละเท่าไรครับ? (พิมพ์ตัวเลข เช่น 20)`,
+      };
+      return env;
+    }
+    if (no) {
+      store.editCourse(sourceId);
+      env.summary = {
+        ok: true,
+        step: "course",
+        message: "ได้ครับ พิมพ์ชื่อสนามใหม่ หรือ “ชื่อ + พาร์ 18 หลุม” อีกครั้ง",
+      };
+      return env;
+    }
+    env.summary = { ok: false, step: "confirm_course", message: "พิมพ์ “ยืนยัน” หรือ “แก้ไข” ครับ" };
     return env;
   }
 

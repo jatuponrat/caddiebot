@@ -25,7 +25,7 @@ export function detectIntent(text) {
   if (/(รวม\s*18|รวมเงิน|เคลียร์เงิน|สรุปเงิน|สรุปผล|สรุป|คิดเงิน|settle)/i.test(t)) return "settle";
   if (/(สร้างเกม|สร้าง\s*เกม|create\s*game|new\s*game)/i.test(t)) return "create_game";
   if (/(เข้าร่วม|join)/i.test(t)) return "join";
-  if (/(หลุม|hole|รู)\s*\d/i.test(t)) return "hole_scores";
+  if (/(หลุม|hole|รู)\s*\d/i.test(t) || /^h\s*\d{1,2}\b/i.test(t)) return "hole_scores";
   // Course par card: "454354434 443535444" (9+9), 18 contiguous digits, or "พาร์ ...".
   const noKw = t.replace(/^(พาร์|par|สนาม|course)\s*[:：]?\s*/i, "");
   const compact = noKw.replace(/\s+/g, "");
@@ -72,7 +72,7 @@ export function parseJoin(text) {
  */
 export function parseHoleScores(text) {
   const t = normalize(text);
-  const holeMatch = t.match(/(?:หลุม|hole|รู)\s*[:：]?\s*(\d{1,2})/i);
+  const holeMatch = t.match(/(?:หลุม|hole|รู|\bh)\s*[:：]?\s*(\d{1,2})/i);
   const hole = holeMatch ? Number(holeMatch[1]) : null;
   const rest = holeMatch ? t.replace(holeMatch[0], " ") : t;
 

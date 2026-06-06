@@ -8,6 +8,8 @@ import { GameStore } from "./gameStore.js";
 import { dispatch, welcomeMessage } from "./session.js";
 import { emptyEnvelope } from "./handler.js";
 import { verifySignature, replyJson, replyText } from "./line.js";
+import { initDb, dbEnabled } from "./db.js";
+import { loadCoursesFromDb } from "./courseStore.js";
 
 const PORT = process.env.PORT || 3000;
 const CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET || "";
@@ -109,7 +111,20 @@ app.post("/simulate", (req, res) => {
 
 const isMain = process.argv[1] && import.meta.url === `file://${process.argv[1]}`;
 if (isMain) {
-  app.listen(PORT, () => console.log(`[caddiebot] webhook listening on :${PORT}`));
+  app.listen(PORT, async () => {
+    console.log(`[caddiebot] webhook listening on :${PORT}`);
+    if (dbEnabled()) {
+      const ok = await initDb();
+      if (ok) {
+        const n = await loadCoursesFromDb();
+        console.log(`[caddiebot] DB ready — loaded ${n} saved course(s)`);
+      } else {
+        console.warn("[caddiebot] DB configured but init failed — running in-memory");
+      }
+    } else {
+      console.log("[caddiebot] no DATABASE_URL — running in-memory (no persistence)");
+    }
+  });
 }
 
 export { app, store };

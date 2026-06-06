@@ -85,7 +85,8 @@ export class GameStore {
       stake: null, // money per hole; RECORDED for backend, never settled here
       turbo: null, // boolean
       turbo_holes: [], // e.g. [9, 18] when turbo is on
-      setup: "course", // pending step: course -> stake -> turbo -> done
+      setup: "course", // pending step: course -> [confirm_course] -> stake -> turbo -> done
+      pending_course: null, // {holes,total} awaiting "ยืนยัน" when entered as name+par
       // --- play data ---
       course: null, // 18-hole par data
       players: [], // { name, scores, handicap_index }
@@ -121,6 +122,37 @@ export class GameStore {
     if (!game) return { ok: false, error: "no active game" };
     game.course_name = String(name || "").trim() || null;
     game.setup = "stake";
+    return { ok: true, game };
+  }
+
+  /** Stash a name+par course awaiting the user's "ยืนยัน". */
+  setPendingCourse(sourceId, name, holes, total) {
+    const game = this._resolve(null, sourceId);
+    if (!game) return { ok: false, error: "no active game" };
+    game.course_name = String(name || "").trim() || null;
+    game.pending_course = { holes, total };
+    game.setup = "confirm_course";
+    return { ok: true, game };
+  }
+
+  /** Apply the pending course after confirmation, then move on to stake. */
+  confirmCourse(sourceId) {
+    const game = this._resolve(null, sourceId);
+    if (!game || !game.pending_course) return { ok: false, error: "no pending course" };
+    const { course } = validateCourse({ name: game.course_name, holes: game.pending_course.holes });
+    game.course = course;
+    const total = game.pending_course.total;
+    game.pending_course = null;
+    game.setup = "stake";
+    return { ok: true, game, total };
+  }
+
+  /** Discard the pending course and ask for the name again. */
+  editCourse(sourceId) {
+    const game = this._resolve(null, sourceId);
+    if (!game) return { ok: false, error: "no active game" };
+    game.pending_course = null;
+    game.setup = "course";
     return { ok: true, game };
   }
 
