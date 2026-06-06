@@ -136,3 +136,56 @@ export function validateCourse(course) {
     course: { name: course.name ?? "", holes, total_par: totalPar },
   };
 }
+
+/* ----------------------------------------------------------------------------
+ * MONEY (pairwise / match, ties split = no payment)
+ * Per hole, every PAIR compares NET; lower net wins the stake from the higher.
+ * Equal net pays nothing. This is a game tally only — never a real transfer.
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Settle ONE hole pairwise among rows that have a numeric `net`.
+ * @param {{name:string, net?:number}[]} rows
+ * @param {number} stake - money per pairwise win on this hole (turbo already applied)
+ * @returns {Object<string, number>} name -> amount won(+)/lost(-) this hole
+ */
+export function settleHole(rows, stake) {
+  const res = {};
+  const valid = (rows || []).filter((r) => r && r.net != null);
+  valid.forEach((r) => (res[r.name] = 0));
+  for (let i = 0; i < valid.length; i++) {
+    for (let j = i + 1; j < valid.length; j++) {
+      const a = valid[i];
+      const b = valid[j];
+      if (a.net < b.net) {
+        res[a.name] += stake;
+        res[b.name] -= stake;
+      } else if (b.net < a.net) {
+        res[b.name] += stake;
+        res[a.name] -= stake;
+      } // equal net -> no payment (split)
+    }
+  }
+  return res;
+}
+
+/**
+ * Settle the whole game (all recorded holes). Turbo holes use double stake.
+ * @returns {{perPlayer:Object<string,number>, perHole:Array, holesCounted:number}}
+ */
+export function settleGame(game) {
+  const totals = {};
+  (game.players || []).forEach((p) => (totals[p.name] = 0));
+  const perHole = [];
+  const nums = Object.keys(game.holes || {})
+    .map(Number)
+    .sort((a, b) => a - b);
+  for (const hole of nums) {
+    const mult = game.turbo && (game.turbo_holes || []).includes(hole) ? 2 : 1;
+    const stake = (game.stake || 0) * mult;
+    const results = settleHole(game.holes[hole], stake);
+    for (const name in results) if (name in totals) totals[name] += results[name];
+    perHole.push({ hole, turbo: mult > 1, stake, results });
+  }
+  return { perPlayer: totals, perHole, holesCounted: nums.length };
+}

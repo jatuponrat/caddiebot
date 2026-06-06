@@ -12,6 +12,9 @@ import {
   validateCourse,
 } from "./engine.js";
 
+const SESSION_TTL_MS = 6 * 60 * 60 * 1000; // a game/session stays alive 6 hours
+const TURBO_HOLES = [9, 18]; // closing hole of each nine
+
 export class GameStore {
   constructor() {
     this.rooms = new Map(); // room_code -> game
@@ -27,39 +30,132 @@ export class GameStore {
     return code;
   }
 
-  /** Resolve the game for a room_code, falling back to the source's active room. */
-  _resolve(room_code, sourceId) {
-    if (room_code && this.rooms.has(room_code)) return this.rooms.get(room_code);
-    if (sourceId && this.activeBySource.has(sourceId)) {
-      return this.rooms.get(this.activeBySource.get(sourceId)) || null;
+  _expired(game) {
+    return Boolean(game && game.expires_at && Date.now() > game.expires_at);
+  }
+
+  _drop(game) {
+    if (!game) return;
+    this.rooms.delete(game.room_code);
+    if (game.source_id && this.activeBySource.get(game.source_id) === game.room_code) {
+      this.activeBySource.delete(game.source_id);
     }
-    return null;
+  }
+
+  /** Rolling 6h window: any interaction keeps the session alive another 6h. */
+  _touch(game) {
+    if (game) game.expires_at = Date.now() + SESSION_TTL_MS;
+  }
+
+  /** Resolve the game for a room_code, falling back to the source's active room.
+   *  Expired games are dropped; valid games are touched (TTL refreshed). */
+  _resolve(room_code, sourceId) {
+    let game = null;
+    if (room_code && this.rooms.has(room_code)) game = this.rooms.get(room_code);
+    else if (sourceId && this.activeBySource.has(sourceId)) {
+      game = this.rooms.get(this.activeBySource.get(sourceId)) || null;
+    }
+    if (this._expired(game)) {
+      this._drop(game);
+      return null;
+    }
+    if (game) this._touch(game);
+    return game;
   }
 
   getGame(room_code) {
-    return this.rooms.get(room_code) || null;
+    const game = this.rooms.get(room_code) || null;
+    if (this._expired(game)) {
+      this._drop(game);
+      return null;
+    }
+    return game;
   }
 
   createGame(sourceId, { expected_players = null } = {}) {
     const room_code = this._newCode();
+    const now = Date.now();
     const game = {
       room_code,
       source_id: sourceId || null,
       expected_players,
       status: "waiting_players",
-      course: null,
+      // --- game setup, collected via guided Q&A after "สร้างเกม" ---
+      course_name: null,
+      stake: null, // money per hole; RECORDED for backend, never settled here
+      turbo: null, // boolean
+      turbo_holes: [], // e.g. [9, 18] when turbo is on
+      setup: "course", // pending step: course -> stake -> turbo -> done
+      // --- play data ---
+      course: null, // 18-hole par data
       players: [], // { name, scores, handicap_index }
       diff: null,
       handicap_level: null,
       rules: null,
-      receivers: [], // names that receive strokes (demo rule, see _recompute)
+      receivers: [],
       holes: {}, // holeNumber -> [{ name, gross, strokes?, net? }]
-      created_at: Date.now(),
+      current_hole: null, // the hole the round is waiting on (set when roster is full)
+      created_at: now,
+      expires_at: now + SESSION_TTL_MS,
     };
     this.rooms.set(room_code, game);
     if (sourceId) this.activeBySource.set(sourceId, room_code);
     return game;
   }
+
+  // ---- guided setup --------------------------------------------------------
+
+  /** The active game for this source if it's still mid-setup, else null. */
+  pendingSetup(sourceId) {
+    const game = this._resolve(null, sourceId);
+    return game && game.setup && game.setup !== "done" ? game : null;
+  }
+
+  /** The active (non-expired) game for this source, or null. */
+  activeGame(sourceId) {
+    return this._resolve(null, sourceId);
+  }
+
+  setCourseName(sourceId, name) {
+    const game = this._resolve(null, sourceId);
+    if (!game) return { ok: false, error: "no active game" };
+    game.course_name = String(name || "").trim() || null;
+    game.setup = "stake";
+    return { ok: true, game };
+  }
+
+  setStake(sourceId, stake) {
+    const game = this._resolve(null, sourceId);
+    if (!game) return { ok: false, error: "no active game" };
+    game.stake = Number(stake);
+    game.setup = "turbo";
+    return { ok: true, game };
+  }
+
+  setTurbo(sourceId, on) {
+    const game = this._resolve(null, sourceId);
+    if (!game) return { ok: false, error: "no active game" };
+    game.turbo = Boolean(on);
+    game.turbo_holes = on ? [...TURBO_HOLES] : [];
+    game.setup = "done";
+    return { ok: true, game };
+  }
+
+  /** End the setup Q&A early (e.g. when real gameplay begins). */
+  finishSetup(sourceId) {
+    const game = this._resolve(null, sourceId);
+    if (game) game.setup = "done";
+    return game;
+  }
+
+  cancelGame(sourceId) {
+    const game = this._resolve(null, sourceId);
+    if (!game) return false;
+    this._drop(game);
+    return true;
+  }
+
+  // ---- course / roster / scoring ------------------------------------------
 
   setCourse(room_code, sourceId, courseInput) {
     const game = this._resolve(room_code, sourceId);
@@ -111,7 +207,8 @@ export class GameStore {
     }
   }
 
-  /** Record one hole. Net is computed only when the course (par) + rules exist. */
+  /** Record a hole, UPSERTING the submitted players (so each person can send
+   *  their own score separately). Net is computed when course (par) + rules exist. */
   recordHole(sourceId, { room_code, hole, players }) {
     const game = this._resolve(room_code, sourceId);
     if (!game) return { ok: false, error: "room_not_found" };
@@ -123,19 +220,51 @@ export class GameStore {
     const rules = game.rules;
     const recv = new Set(game.receivers || []);
     const canNet = Boolean(rules && par != null);
+    const arr = game.holes[hole] || (game.holes[hole] = []);
 
-    const rows = players.map((p) => {
+    for (const p of players) {
       const row = { name: p.name, gross: p.gross };
       if (canNet) {
         const strokes = recv.has(p.name) ? strokesForHole(par, rules) : 0;
         row.strokes = strokes;
         row.net = computeNet(p.gross, strokes);
       }
-      return row;
-    });
+      const idx = arr.findIndex((r) => r.name === p.name);
+      if (idx >= 0) arr[idx] = row;
+      else arr.push(row);
+    }
 
-    game.holes[hole] = rows;
     if (game.status === "ready") game.status = "in_progress";
-    return { ok: true, game, par, net_computed: canNet, players: rows };
+    return { ok: true, game, par, net_computed: canNet, hole: Number(hole) };
+  }
+
+  /** Record ALL 18 holes for one player at once (upserts that player per hole). */
+  recordBulk(sourceId, name, scores) {
+    const game = this._resolve(null, sourceId);
+    if (!game) return { ok: false, error: "room_not_found" };
+    if (!Array.isArray(scores) || scores.length !== 18) {
+      return { ok: false, error: "need_18", game };
+    }
+    const rules = game.rules;
+    const recv = new Set(game.receivers || []);
+    for (let i = 0; i < 18; i++) {
+      const hole = i + 1;
+      const gross = scores[i];
+      const par = game.course
+        ? game.course.holes.find((h) => Number(h.hole) === hole)?.par ?? null
+        : null;
+      const row = { name, gross };
+      if (rules && par != null) {
+        const strokes = recv.has(name) ? strokesForHole(par, rules) : 0;
+        row.strokes = strokes;
+        row.net = computeNet(gross, strokes);
+      }
+      const arr = game.holes[hole] || (game.holes[hole] = []);
+      const idx = arr.findIndex((r) => r.name === name);
+      if (idx >= 0) arr[idx] = row;
+      else arr.push(row);
+    }
+    if (game.status === "ready") game.status = "in_progress";
+    return { ok: true, game, name };
   }
 }

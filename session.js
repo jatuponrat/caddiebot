@@ -8,15 +8,52 @@ import {
   parseCreateGame,
   parseJoin,
   parseHoleScores,
+  parseParString,
+  parseBulkScores,
+  lookupPresetCourse,
 } from "./parser.js";
+import { settleHole, settleGame } from "./engine.js";
 import { emptyEnvelope } from "./handler.js";
+
+/** "A +40, B −20, C 0" — format a {name: amount} money map for chat. */
+function fmtMoney(map) {
+  return Object.entries(map)
+    .map(([n, v]) => (v > 0 ? `${n} +${v}` : v < 0 ? `${n} −${Math.abs(v)}` : `${n} 0`))
+    .join(", ");
+}
+
+function parForHole(game, hole) {
+  const holes = game && game.course && game.course.holes;
+  if (!holes) return null;
+  const h = holes.find((x) => Number(x.hole) === Number(hole));
+  return h ? h.par : null;
+}
+
+/** "⛳ หลุม 1 Par 4 เริ่ม !!" (par from the room's course). */
+function holeAnnounce(game, n) {
+  const par = parForHole(game, n);
+  return par != null ? `⛳ หลุม ${n} Par ${par} เริ่ม !!` : `⛳ หลุม ${n} เริ่ม !!`;
+}
+
+/** When the roster is full, kick off hole 1 (or ask for pars first). */
+function maybeStartRound(game) {
+  if (game.status === "ready" && game.current_hole == null) {
+    if (game.course) {
+      game.current_hole = 1;
+      return `\n🏁 ผู้เล่นครบแล้ว!\n${holeAnnounce(game, 1)}`;
+    }
+    return `\n🏁 ผู้เล่นครบแล้ว! กรอกพาร์สนามก่อน เช่น “454354434 443535444”`;
+  }
+  return "";
+}
 
 const WELCOME_TH =
   "สวัสดีครับ ผมแคดดี้บอท ⛳\n" +
   "พิมพ์ “สร้างเกม 4 คน” เพื่อเริ่ม\n" +
-  "เข้าร่วม: “เข้าร่วม <รหัส> ชื่อ <ชื่อ> 92,95,90”\n" +
+  "กรอกพาร์สนาม: “454354434 443535444”\n" +
+  "เข้าร่วม: “เข้าร่วม แซม 105 90 91”\n" +
   "ลงแต้ม: “หลุม 1 A 5 B 6 C 5 D 7”\n" +
-  "ส่งรูปสกอร์การ์ดเพื่อดึงพาร์ 18 หลุม";
+  "สรุปเงิน: “รวม 18” · จบเกม: “จบเกม”";
 
 export function welcomeMessage() {
   return WELCOME_TH;
@@ -29,7 +66,33 @@ export function welcomeMessage() {
  * @returns standard envelope (with Thai summary.message)
  */
 export function dispatch(text, sourceId, store) {
+  const raw = String(text ?? "");
   const intent = detectIntent(text);
+
+  // Cancel a game that is mid-setup.
+  if (/^\s*(ยกเลิก|cancel)\s*$/i.test(raw) && store.pendingSetup(sourceId)) {
+    store.cancelGame(sourceId);
+    const env = emptyEnvelope();
+    env.action = "cancel";
+    env.summary = { ok: true, message: "ยกเลิกเกมแล้ว — พิมพ์ “สร้างเกม” เพื่อเริ่มใหม่" };
+    return env;
+  }
+
+  // Guided setup: while a game is mid-setup, free-text replies are the answers.
+  const pending = store.pendingSetup(sourceId);
+  if (pending && intent === "unknown") {
+    return handleSetupAnswer(raw, sourceId, store, pending);
+  }
+  // Real gameplay starting? End any leftover setup so later chat isn't captured.
+  if (
+    pending &&
+    (intent === "join" ||
+      intent === "hole_scores" ||
+      intent === "par_string" ||
+      intent === "bulk_scores")
+  ) {
+    store.finishSetup(sourceId);
+  }
 
   if (intent === "create_game") {
     const { expected_players } = parseCreateGame(text);
@@ -41,10 +104,43 @@ export function dispatch(text, sourceId, store) {
       ok: true,
       status: game.status,
       expected_players,
+      setup: "course",
       message:
-        `สร้างห้อง ${game.room_code} แล้ว ✅ รอผู้เล่นเข้าร่วม` +
-        (expected_players ? ` (0/${expected_players})` : ""),
+        `สร้างห้อง ${game.room_code} แล้ว ✅` +
+        (expected_players ? ` (${expected_players} คน)` : "") +
+        `\nสนามชื่ออะไรครับ? (พิมพ์ชื่อสนาม)`,
     };
+    return env;
+  }
+
+  if (intent === "end_game") {
+    const env = emptyEnvelope();
+    env.action = "end_game";
+    const g = store.activeGame(sourceId);
+    if (!g) {
+      env.summary = { ok: false, message: "ไม่มีเกมที่กำลังเล่นอยู่ในกลุ่มนี้" };
+      return env;
+    }
+    const names = g.players.map((p) => p.name).join(", ") || "—";
+    const holesPlayed = Object.keys(g.holes).length;
+    const s = settleGame(g);
+    const settleLine = s.holesCounted
+      ? `\n💰 สรุปเงิน (${s.holesCounted} หลุม): ${fmtMoney(s.perPlayer)}\n(บวก = ได้ / ลบ = จ่าย)`
+      : "\n(ยังไม่มีสกอร์ที่บันทึก)";
+    env.players = g.players;
+    env.summary = {
+      ok: true,
+      course_name: g.course_name,
+      stake: g.stake,
+      turbo: g.turbo,
+      holes_played: holesPlayed,
+      per_player: s.perPlayer,
+      message:
+        `จบเกมแล้ว ✅\n` +
+        `สนาม ${g.course_name || "-"} · ผู้เล่น: ${names} · ${holesPlayed}/18 หลุม` +
+        settleLine,
+    };
+    store.cancelGame(sourceId);
     return env;
   }
 
@@ -61,7 +157,7 @@ export function dispatch(text, sourceId, store) {
         message:
           r.error === "room_not_found"
             ? "ไม่พบห้อง — พิมพ์ “สร้างเกม” ก่อน หรือใส่รหัสห้องให้ถูกต้อง"
-            : "ต้องมีชื่อและสกอร์ 3 รอบ เช่น “เข้าร่วม 4821 ชื่อ A 92,95,90”",
+            : "ต้องมีชื่อและสกอร์ 3 รอบ เช่น “เข้าร่วม แซม 105 90 91”",
       };
       return env;
     }
@@ -79,7 +175,7 @@ export function dispatch(text, sourceId, store) {
       message:
         `${parsed.player} เข้าร่วมแล้ว (แต้มต่อ ${r.handicap_index}) ` +
         `— ผู้เล่น ${count}${cap} คน` +
-        (g.status === "ready" ? " ครบแล้ว เริ่มได้เลย!" : ""),
+        maybeStartRound(g),
     };
     return env;
   }
@@ -100,18 +196,62 @@ export function dispatch(text, sourceId, store) {
       };
       return env;
     }
-    env.players = r.players;
-    env.handicap_level = r.game.handicap_level;
-    env.rules = r.game.rules;
+    const game = r.game;
+    const hole = r.hole;
+    const rows = game.holes[hole] || [];
+    const registered = game.players.map((p) => p.name);
+    const waiting = registered.filter((n) => !rows.some((x) => x.name === n));
+    const complete = registered.length > 0 && waiting.length === 0;
+    env.players = rows;
+    env.handicap_level = game.handicap_level;
+    env.rules = game.rules;
+
+    if (!complete) {
+      const got = parsed.players.map((p) => p.name).join(", ");
+      env.summary = {
+        ok: true,
+        hole,
+        complete: false,
+        message:
+          `รับหลุม ${hole}: ${got || "-"} ✅` +
+          (registered.length ? ` (รออีก: ${waiting.join(", ")})` : ""),
+      };
+      return env;
+    }
+
+    // everyone is in for this hole
+    const turbo = Boolean(game.turbo && (game.turbo_holes || []).includes(hole));
+    const netComputed = Boolean(game.rules && r.par != null);
+    const turboTag = turbo ? " 🔥 หลุมเทอร์โบ" : "";
+    const stakeHole = (game.stake || 0) * (turbo ? 2 : 1);
+    let holeMoney = null;
+    let moneyLine = "";
+    if (netComputed && game.stake) {
+      holeMoney = settleHole(rows, stakeHole);
+      moneyLine = `\n💰 หลุมนี้ (หลุมละ ${stakeHole}): ${fmtMoney(holeMoney)}`;
+    }
+    // advance the round pointer + announce the next hole
+    let nextLine = "";
+    if (game.current_hole == null || hole === game.current_hole) {
+      const next = hole + 1;
+      if (next <= 18) {
+        game.current_hole = next;
+        if (game.course) nextLine = `\n${holeAnnounce(game, next)}`;
+      } else {
+        game.current_hole = null;
+        nextLine = `\n🏁 ครบ 18 หลุม! พิมพ์ “รวม 18” หรือ “จบเกม” เพื่อสรุปเงิน`;
+      }
+    }
     env.summary = {
       ok: true,
-      hole: parsed.hole,
+      hole,
+      complete: true,
       par: r.par,
-      net_computed: r.net_computed,
-      message: r.net_computed
-        ? `บันทึกหลุม ${parsed.hole} แล้ว (คิด net จากแต้มต่อให้แล้ว)`
-        : `บันทึกหลุม ${parsed.hole} แล้ว — ส่งรูปสกอร์การ์ดก่อนถึงจะคิด net ได้`,
-      note: "ไม่สรุปเงินที่นี่ — เป็นหน้าที่ backend",
+      net_computed: netComputed,
+      turbo,
+      stake: game.stake,
+      money: holeMoney,
+      message: `หลุม ${hole} ครบทุกคน ✅${turboTag}${moneyLine}${nextLine}`,
     };
     return env;
   }
@@ -132,8 +272,93 @@ export function dispatch(text, sourceId, store) {
       ok: r.ok,
       errors: r.errors,
       message: r.ok
-        ? `บันทึกสนามแล้ว (พาร์รวม ${r.game.course.total_par})`
+        ? `บันทึกสนามแล้ว (พาร์รวม ${r.game.course.total_par})` + maybeStartRound(r.game)
         : "ข้อมูลสนามไม่ครบ 18 หลุม หรือค่าพาร์ผิด",
+    };
+    return env;
+  }
+
+  if (intent === "settle") {
+    const env = emptyEnvelope();
+    env.action = "settle";
+    const g = store.activeGame(sourceId);
+    if (!g) {
+      env.summary = { ok: false, message: "ไม่มีเกมที่กำลังเล่นอยู่ — พิมพ์ “สร้างเกม” ก่อน" };
+      return env;
+    }
+    const s = settleGame(g);
+    env.players = g.players;
+    env.summary = {
+      ok: true,
+      holes_counted: s.holesCounted,
+      per_player: s.perPlayer,
+      message: s.holesCounted
+        ? `สรุปเงินรวม ${s.holesCounted} หลุม 💰\n${fmtMoney(s.perPlayer)}\n(บวก = ได้ / ลบ = จ่าย)`
+        : "ยังไม่มีสกอร์ที่บันทึก — ลงแต้มก่อนนะครับ",
+    };
+    return env;
+  }
+
+  if (intent === "bulk_scores") {
+    const parsed = parseBulkScores(text);
+    const env = emptyEnvelope();
+    env.action = "bulk_scores";
+    if (!parsed.ok) {
+      env.summary = {
+        ok: false,
+        message:
+          parsed.reason === "count"
+            ? `สกอร์ต้องครบ 18 หลุม (นับได้ ${parsed.count}) เช่น “แซม 544535445 445354454”`
+            : `สกอร์แต่ละหลุมเป็นเลข 1–9 (หลุม 10+ ใช้ “หลุม X …” แทน)`,
+      };
+      return env;
+    }
+    const r = store.recordBulk(sourceId, parsed.name, parsed.scores);
+    if (!r.ok) {
+      env.summary = { ok: false, message: "ยังไม่มีเกมในกลุ่มนี้ — พิมพ์ “สร้างเกม” ก่อน" };
+      return env;
+    }
+    env.summary = {
+      ok: true,
+      player: parsed.name,
+      message: `รับสกอร์ ${parsed.name} ครบ 18 หลุมแล้ว ✅\nครบทุกคนแล้วพิมพ์ “รวม 18” เพื่อสรุปเงิน`,
+    };
+    return env;
+  }
+
+  if (intent === "par_string") {
+    const r = parseParString(text);
+    const env = emptyEnvelope();
+    env.action = "set_course_par";
+    if (!r.ok) {
+      env.summary = {
+        ok: false,
+        message:
+          r.reason === "count"
+            ? `กรอกพาร์ไม่ครบ 18 หลุม (นับได้ ${r.count} ตัว) — กรอกใหม่ เช่น “454354434 443535444”`
+            : `ค่าพาร์ต้องเป็นเลข 3–6 เท่านั้น — กรอกใหม่ เช่น “454354434 443535444”`,
+      };
+      return env;
+    }
+    const set = store.setCourse(null, sourceId, { name: "", holes: r.holes });
+    if (!set.ok && set.error === "no active game") {
+      env.summary = {
+        ok: false,
+        message: "ยังไม่มีเกมในกลุ่มนี้ — พิมพ์ “สร้างเกม” ก่อนแล้วค่อยกรอกพาร์",
+      };
+      return env;
+    }
+    env.course = set.game?.course ?? null;
+    env.handicap_level = set.game?.handicap_level ?? null;
+    const note = r.total < 69 || r.total > 74 ? " (ปกติ 70–72 ลองเช็กอีกครั้ง)" : "";
+    env.summary = {
+      ok: true,
+      total_par: r.total,
+      out: r.out,
+      in: r.in,
+      message:
+        `กรอกพาร์ ${r.total} สำเร็จแล้ว ✅ (OUT ${r.out} / IN ${r.in})${note}` +
+        maybeStartRound(set.game),
     };
     return env;
   }
@@ -143,7 +368,82 @@ export function dispatch(text, sourceId, store) {
   env.summary = {
     ok: false,
     message:
-      "พิมพ์ “สร้างเกม”, “เข้าร่วม <รหัส> ชื่อ <ชื่อ> 92,95,90”, หรือ “หลุม 1 A 5 B 6”",
+      "พิมพ์ “สร้างเกม”, “กรอกพาร์ 454354434 443535444”, “เข้าร่วม แซม 105 90 91”, หรือ “หลุม 1 A 5 B 6”",
   };
+  return env;
+}
+
+/** Guided game setup: consume the next free-text reply as course -> stake -> turbo. */
+function handleSetupAnswer(text, sourceId, store, game) {
+  const env = emptyEnvelope();
+  env.action = "game_setup";
+  const t = String(text).trim();
+
+  if (game.setup === "course") {
+    const preset = lookupPresetCourse(t);
+    const r = store.setCourseName(sourceId, t);
+    let line;
+    if (preset && preset.ok) {
+      store.setCourse(null, sourceId, { name: r.game.course_name, holes: preset.holes });
+      env.course = r.game.course;
+      line = `สนาม ${r.game.course_name} ✅ โหลดพาร์ ${preset.total} ให้อัตโนมัติ`;
+    } else {
+      line = `สนาม ${r.game.course_name} ✅ (ไม่มีพาร์สำเร็จรูป เดี๋ยวกรอกพาร์เองทีหลัง เช่น “454354434 443535444”)`;
+    }
+    env.summary = {
+      ok: true,
+      step: "stake",
+      course_name: r.game.course_name,
+      par_loaded: Boolean(preset && preset.ok),
+      message: `${line}\nเล่นกันหลุมละเท่าไรครับ? (พิมพ์ตัวเลข เช่น 20)`,
+    };
+    return env;
+  }
+
+  if (game.setup === "stake") {
+    const num = (t.match(/\d+/) || [])[0];
+    if (!num) {
+      env.summary = { ok: false, step: "stake", message: "พิมพ์เป็นตัวเลขครับ เช่น 20 (หลุมละกี่บาท)" };
+      return env;
+    }
+    const r = store.setStake(sourceId, Number(num));
+    env.summary = {
+      ok: true,
+      step: "turbo",
+      stake: r.game.stake,
+      message: `หลุมละ ${r.game.stake} ✅\nมีเทอร์โบไหมครับ? (พิมพ์ มี / ไม่มี)`,
+    };
+    return env;
+  }
+
+  if (game.setup === "turbo") {
+    const no = /ไม่มี|ไม่|\bno\b|^n$/i.test(t);
+    const yes = !no && /มี|ใช่|\byes\b|^y$|turbo|เทอร์โบ/i.test(t);
+    if (!yes && !no) {
+      env.summary = { ok: false, step: "turbo", message: "ตอบ “มี” หรือ “ไม่มี” ครับ" };
+      return env;
+    }
+    const r = store.setTurbo(sourceId, yes);
+    const g = r.game;
+    const turboLine = g.turbo
+      ? `เทอร์โบ: หลุม ${g.turbo_holes.join(" และ ")} 🔥`
+      : "ไม่มีเทอร์โบ";
+    env.summary = {
+      ok: true,
+      step: "done",
+      course_name: g.course_name,
+      stake: g.stake,
+      turbo: g.turbo,
+      turbo_holes: g.turbo_holes,
+      message:
+        `ตั้งค่าเกมเรียบร้อย ✅\n` +
+        `สนาม ${g.course_name} · หลุมละ ${g.stake} · ${turboLine}\n` +
+        `ต่อไป:\n• กรอกพาร์: 454354434 443535444\n• ผู้เล่นพิมพ์: เข้าร่วม แซม 105 90 91`,
+    };
+    return env;
+  }
+
+  env.action = "unknown";
+  env.summary = { ok: false, message: "" };
   return env;
 }
