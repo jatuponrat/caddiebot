@@ -138,9 +138,17 @@ export function validateCourse(course) {
 }
 
 /* ----------------------------------------------------------------------------
- * MONEY (pairwise / match, ties split = no payment)
- * Per hole, every PAIR compares NET; lower net wins the stake from the higher.
- * Equal net pays nothing. This is a game tally only — never a real transfer.
+ * MONEY — two settlement modes
+ *
+ * "all_vs_all"  (กินกันทุกคน): every PAIR compares NET; lower net wins the
+ *               stake from the higher. Equal net = no payment.
+ *
+ * "head_tail"   (หัวกินหาง): players ranked by net (ascending = better).
+ *               Pair position-1 vs position-N, 2 vs N-1, … Ties with an
+ *               adjacent position cancel the pairing ("ชนตัดเจ๊า").
+ *               Middle player in odd-count group pays nothing (รอด).
+ *
+ * Both are game tallies only — never real transfers.
  * -------------------------------------------------------------------------- */
 
 /**
@@ -181,6 +189,54 @@ export function settleHole(rows, stake) {
   return res;
 }
 
+/**
+ * Settle ONE hole head-eats-tail (หัวกินหาง).
+ * Players ranked by net ascending (lower = better); give_up treated as Infinity.
+ * Pair index-0 (head) vs index-N-1 (tail), index-1 vs index-N-2, …
+ * A pairing fires only when BOTH players are "unique" — their net differs from
+ * the player immediately above and below them in the ranking.
+ * Tied adjacent players cancel the pairing ("ชนตัดเจ๊า").
+ *
+ * @param {{name:string, net?:number, give_up?:boolean}[]} rows
+ * @param {number} stake - money per pair win (turbo already applied)
+ * @returns {Object<string, number>} name -> amount won(+)/lost(-) this hole
+ */
+export function settleHoleHeadEatsTail(rows, stake) {
+  const res = {};
+  const valid = (rows || []).filter((r) => r && (r.give_up || r.net != null));
+  valid.forEach((r) => (res[r.name] = 0));
+  if (valid.length < 2) return res;
+
+  // Sort ascending by net; give_up players go to the tail (worst)
+  const sorted = [...valid].sort((a, b) => {
+    if (a.give_up && b.give_up) return 0;
+    if (a.give_up) return 1;
+    if (b.give_up) return -1;
+    return a.net - b.net;
+  });
+
+  const n = sorted.length;
+  const netOf = (i) => (sorted[i].give_up ? Infinity : sorted[i].net);
+
+  const isUnique = (index) => {
+    const cur = netOf(index);
+    const prev = index > 0 ? netOf(index - 1) : null;
+    const next = index < n - 1 ? netOf(index + 1) : null;
+    return cur !== prev && cur !== next;
+  };
+
+  for (let i = 0; i < Math.floor(n / 2); i++) {
+    const headIdx = i;
+    const tailIdx = n - 1 - i;
+    if (isUnique(headIdx) && isUnique(tailIdx)) {
+      res[sorted[headIdx].name] += stake; // head (lower net) wins
+      res[sorted[tailIdx].name] -= stake; // tail (higher net) loses
+    }
+  }
+
+  return res;
+}
+
 /** Emoji for a hole result vs par (gross == null means gave up). */
 export function scoreEmoji(gross, par) {
   if (gross == null || par == null) return "🏳️"; // give up / unknown
@@ -194,6 +250,7 @@ export function scoreEmoji(gross, par) {
 
 /**
  * Settle the whole game (all recorded holes). Turbo holes use double stake.
+ * Uses settleHoleHeadEatsTail when game.format === "head_tail", else settleHole.
  * @returns {{perPlayer:Object<string,number>, perHole:Array, holesCounted:number}}
  */
 export function settleGame(game) {
@@ -203,10 +260,11 @@ export function settleGame(game) {
   const nums = Object.keys(game.holes || {})
     .map(Number)
     .sort((a, b) => a - b);
+  const settleFn = game.format === "head_tail" ? settleHoleHeadEatsTail : settleHole;
   for (const hole of nums) {
     const mult = game.turbo && (game.turbo_holes || []).includes(hole) ? 2 : 1;
     const stake = (game.stake || 0) * mult;
-    const results = settleHole(game.holes[hole], stake);
+    const results = settleFn(game.holes[hole], stake);
     for (const name in results) if (name in totals) totals[name] += results[name];
     perHole.push({ hole, turbo: mult > 1, stake, results });
   }

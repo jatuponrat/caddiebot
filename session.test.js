@@ -131,7 +131,7 @@ test("invalid par card asks to re-enter", () => {
   assert.match(out.summary.message, /กรอกใหม่|18/);
 });
 
-test("guided setup: course -> stake -> turbo (มี)", () => {
+test("guided setup: course -> stake -> turbo -> format (full flow)", () => {
   const store = new GameStore();
   const G = "Gsetup";
   let out = dispatch("สร้างเกม 4 คน", G, store);
@@ -141,12 +141,44 @@ test("guided setup: course -> stake -> turbo (มี)", () => {
   assert.equal(out.summary.step, "stake");
   out = dispatch("20", G, store);
   assert.equal(out.summary.step, "turbo");
+  // turbo now advances to format step
   out = dispatch("มี", G, store);
-  assert.equal(out.summary.step, "done");
+  assert.equal(out.summary.step, "format");
   assert.equal(out.summary.turbo, true);
   assert.deepEqual(out.summary.turbo_holes, [9, 18]);
   assert.equal(out.summary.stake, 20);
   assert.match(out.summary.message, /เทอร์โบ: หลุม 9 และ 18/);
+  assert.match(out.summary.message, /กินกันทุกคน|หัวกินหาง/);
+  // choose กินกันทุกคน -> done
+  out = dispatch("1", G, store);
+  assert.equal(out.summary.step, "done");
+  assert.equal(out.summary.format, "all_vs_all");
+  assert.match(out.summary.message, /ตั้งค่าเกมเรียบร้อย/);
+});
+
+test("guided setup: กติกา step rejects invalid answer", () => {
+  const store = new GameStore();
+  const G = "GformatBad";
+  dispatch("สร้างเกม 4 คน", G, store);
+  dispatch("The Pine", G, store);
+  dispatch("20", G, store);
+  dispatch("ไม่มี", G, store); // turbo -> now at format step
+  const out = dispatch("บางอย่าง", G, store);
+  assert.equal(out.summary.ok, false);
+  assert.equal(out.summary.step, "format");
+});
+
+test("guided setup: หัวกินหาง selected and stored on game", () => {
+  const store = new GameStore();
+  const G = "Gformat2";
+  dispatch("สร้างเกม 4 คน", G, store);
+  dispatch("The Pine", G, store);
+  dispatch("20", G, store);
+  dispatch("ไม่มี", G, store); // turbo -> format step
+  const out = dispatch("2", G, store); // select หัวกินหาง
+  assert.equal(out.summary.step, "done");
+  assert.equal(out.summary.format, "head_tail");
+  assert.match(out.summary.message, /หัวกินหาง/);
 });
 
 test("guided setup: ไม่มี turbo", () => {
@@ -389,6 +421,33 @@ test("H1 shorthand records a hole like หลุม 1", () => {
   const out = dispatch("H1 บี 5", G, store); // completes hole 1
   assert.equal(out.summary.hole, 1);
   assert.equal(out.summary.complete, true);
+});
+
+test("หัวกินหาง: per-hole and รวม 18 use head-eats-tail settlement", () => {
+  const store = new GameStore();
+  const G = "Ghet";
+  // 4 equal-handicap players -> level 0, no strokes
+  dispatch("สร้างเกม 4 คน", G, store);
+  dispatch("The Pine", G, store); // par loaded
+  dispatch("20", G, store); // stake 20
+  dispatch("ไม่มี", G, store); // no turbo -> format step
+  dispatch("2", G, store); // หัวกินหาง
+  dispatch("เข้าร่วม A 80 80 80", G, store);
+  dispatch("เข้าร่วม B 80 80 80", G, store);
+  dispatch("เข้าร่วม C 80 80 80", G, store);
+  dispatch("เข้าร่วม D 80 80 80", G, store);
+  // all equal handicap -> diff=0 -> level 0, no strokes given
+  // hole 1 net: A=4 B=5 C=6 D=7 -> sorted A B C D -> A vs D unique, B vs C unique
+  const h = dispatch("หลุม 1 A 4 B 5 C 6 D 7", G, store);
+  assert.equal(h.summary.net_computed, true);
+  assert.equal(h.summary.money.A, 20);
+  assert.equal(h.summary.money.B, 20);
+  assert.equal(h.summary.money.C, -20);
+  assert.equal(h.summary.money.D, -20);
+  // settle game totals
+  const s = dispatch("รวม 18", G, store);
+  assert.equal(s.summary.per_player.A, 20);
+  assert.equal(s.summary.per_player.D, -20);
 });
 
 test("custom course via name+par: confirm then saved & usable", () => {

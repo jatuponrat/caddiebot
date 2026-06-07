@@ -12,7 +12,7 @@ import {
   parseBulkScores,
   lookupPresetCourse,
 } from "./parser.js";
-import { settleHole, settleGame, scoreEmoji } from "./engine.js";
+import { settleHole, settleHoleHeadEatsTail, settleGame, scoreEmoji } from "./engine.js";
 import { findCustomCourse, rememberCourse } from "./courseStore.js";
 import { saveRound } from "./db.js";
 import { emptyEnvelope } from "./handler.js";
@@ -246,7 +246,8 @@ export function dispatch(text, sourceId, store) {
     let holeMoney = null;
     let moneyLine = "";
     if (netComputed && game.stake) {
-      holeMoney = settleHole(rows, stakeHole);
+      const settleFn = game.format === "head_tail" ? settleHoleHeadEatsTail : settleHole;
+      holeMoney = settleFn(rows, stakeHole);
       moneyLine = `\n💰 หลุมนี้ (หลุมละ ${stakeHole}): ${fmtMoney(holeMoney)}`;
     }
     // advance the round pointer + announce the next hole
@@ -527,34 +528,68 @@ function handleSetupAnswer(text, sourceId, store, game) {
     return env;
   }
 
-  if (game.setup === "turbo") {
+  if (game.setup === 'turbo') {
     const no = /ไม่มี|ไม่|\bno\b|^n$/i.test(t);
     const yes = !no && /มี|ใช่|\byes\b|^y$|turbo|เทอร์โบ/i.test(t);
     if (!yes && !no) {
-      env.summary = { ok: false, step: "turbo", message: "ตอบ “มี” หรือ “ไม่มี” ครับ" };
+      env.summary = { ok: false, step: 'turbo', message: 'ตอบ “มี” หรือ “ไม่มี” ครับ' };
       return env;
     }
     const r = store.setTurbo(sourceId, yes);
     const g = r.game;
     const turboLine = g.turbo
-      ? `เทอร์โบ: หลุม ${g.turbo_holes.join(" และ ")} 🔥`
-      : "ไม่มีเทอร์โบ";
+      ? `เทอร์โบ: หลุม ${g.turbo_holes.join(' และ ')} 🔥`
+      : 'ไม่มีเทอร์โบ';
     env.summary = {
       ok: true,
-      step: "done",
-      course_name: g.course_name,
+      step: 'format',
       stake: g.stake,
       turbo: g.turbo,
       turbo_holes: g.turbo_holes,
       message:
+        `${turboLine} ✅\nกติกาการแพ้ชนะครับ?\n` +
+        `1️⃣ กินกันทุกคน (ทุกคู่เปรียบสกอร์)\n` +
+        `2️⃣ หัวกินหาง (อันดับ 1 ชนะอันดับสุดท้าย)`,
+    };
+    return env;
+  }
+
+  if (game.setup === 'format') {
+    const isAllVsAll = /^1$|กินกันทุกคน/i.test(t);
+    const isHeadTail = /^2$|หัวกินหาง/i.test(t);
+    if (!isAllVsAll && !isHeadTail) {
+      env.summary = {
+        ok: false,
+        step: 'format',
+        message: 'เลือก “1” กินกันทุกคน หรือ “2” หัวกินหาง ครับ',
+      };
+      return env;
+    }
+    const format = isHeadTail ? 'head_tail' : 'all_vs_all';
+    const r = store.setFormat(sourceId, format);
+    const g = r.game;
+    const turboLine = g.turbo
+      ? `เทอร์โบ: หลุม ${g.turbo_holes.join(' และ ')} 🔥`
+      : 'ไม่มีเทอร์โบ';
+    const formatLabel = format === 'head_tail' ? 'หัวกินหาง 🏹' : 'กินกันทุกคน';
+    env.summary = {
+      ok: true,
+      step: 'done',
+      course_name: g.course_name,
+      stake: g.stake,
+      turbo: g.turbo,
+      turbo_holes: g.turbo_holes,
+      format,
+      message:
         `ตั้งค่าเกมเรียบร้อย ✅\n` +
         `สนาม ${g.course_name} · หลุมละ ${g.stake} · ${turboLine}\n` +
+        `กติกา: ${formatLabel}\n` +
         `ต่อไป:\n• กรอกพาร์: 454354434 443535444\n• ผู้เล่นพิมพ์: เข้าร่วม แซม 105 90 91`,
     };
     return env;
   }
 
-  env.action = "unknown";
-  env.summary = { ok: false, message: "" };
+  env.action = 'unknown';
+  env.summary = { ok: false, message: '' };
   return env;
 }

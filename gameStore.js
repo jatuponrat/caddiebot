@@ -85,7 +85,8 @@ export class GameStore {
       stake: null, // money per hole; RECORDED for backend, never settled here
       turbo: null, // boolean
       turbo_holes: [], // e.g. [9, 18] when turbo is on
-      setup: "course", // pending step: course -> [confirm_course] -> stake -> turbo -> done
+      format: null, // "all_vs_all" | "head_tail"
+      setup: "course", // pending step: course -> [confirm_course] -> stake -> turbo -> format -> done
       pending_course: null, // {holes,total} awaiting "ยืนยัน" when entered as name+par
       // --- play data ---
       course: null, // 18-hole par data
@@ -179,6 +180,14 @@ export class GameStore {
     if (!game) return { ok: false, error: "no active game" };
     game.turbo = Boolean(on);
     game.turbo_holes = on ? [...TURBO_HOLES] : [];
+    game.setup = "format"; // advance to กติกา selection
+    return { ok: true, game };
+  }
+
+  setFormat(sourceId, format) {
+    const game = this._resolve(null, sourceId);
+    if (!game) return { ok: false, error: "no active game" };
+    game.format = format; // "all_vs_all" | "head_tail"
     game.setup = "done";
     return { ok: true, game };
   }
