@@ -153,6 +153,7 @@ export class GameStore {
     const total = game.pending_course.total;
     game.pending_course = null;
     game.setup = "stake";
+    if (game.rules) this._recomputeNets(game);
     return { ok: true, game, total };
   }
 
@@ -203,6 +204,8 @@ export class GameStore {
     if (!game) return { ok: false, error: "no active game" };
     const { valid, errors, course } = validateCourse(courseInput);
     game.course = course;
+    // Retroactively compute net for holes recorded before the course was set.
+    if (valid && game.rules) this._recomputeNets(game);
     return { ok: valid, errors, game };
   }
 
@@ -243,8 +246,31 @@ export class GameStore {
     game.receivers = game.players
       .filter((p) => p.handicap_index > best)
       .map((p) => p.name);
-    if (game.expected_players && game.players.length >= game.expected_players) {
-      if (game.status === "waiting_players") game.status = "ready";
+    // Auto-ready: use expected count when given; otherwise treat 2+ players as full.
+    const cap = game.expected_players;
+    if ((cap ? game.players.length >= cap : game.players.length >= 2) &&
+        game.status === "waiting_players") {
+      game.status = "ready";
+    }
+    // Retroactively recompute net for already-recorded holes when the handicap
+    // rules or receiver list changes (e.g. a new player joins and shifts the diff).
+    if (game.course) this._recomputeNets(game);
+  }
+
+  /** Recompute strokes/net for every already-recorded hole row using the current
+   *  course par + handicap rules. Called after rules or course change mid-game. */
+  _recomputeNets(game) {
+    if (!game.course || !game.rules) return;
+    const recv = new Set(game.receivers || []);
+    for (const [holeNum, rows] of Object.entries(game.holes)) {
+      const par = game.course.holes.find((h) => Number(h.hole) === Number(holeNum))?.par ?? null;
+      if (par == null) continue;
+      for (const row of rows) {
+        if (row.give_up || row.gross == null) continue;
+        const strokes = recv.has(row.name) ? strokesForHole(par, game.rules) : 0;
+        row.strokes = strokes;
+        row.net = computeNet(row.gross, strokes);
+      }
     }
   }
 
@@ -264,11 +290,17 @@ export class GameStore {
     const arr = game.holes[hole] || (game.holes[hole] = []);
 
     for (const p of players) {
-      const row = { name: p.name, gross: p.gross };
-      if (canNet) {
-        const strokes = recv.has(p.name) ? strokesForHole(par, rules) : 0;
-        row.strokes = strokes;
-        row.net = computeNet(p.gross, strokes);
+      const row = { name: p.name };
+      if (p.give_up) {
+        row.give_up = true;
+        row.gross = null;
+      } else {
+        row.gross = p.gross;
+        if (canNet) {
+          const strokes = recv.has(p.name) ? strokesForHole(par, rules) : 0;
+          row.strokes = strokes;
+          row.net = computeNet(p.gross, strokes);
+        }
       }
       const idx = arr.findIndex((r) => r.name === p.name);
       if (idx >= 0) arr[idx] = row;

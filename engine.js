@@ -11,11 +11,11 @@
  * -------------------------------------------------------------------------- */
 export const HANDICAP_RULES_TABLE = {
   0: { par3: 0, par4: 0, par5: 0 }, // diff <= 5  -> even game
-  1: { par3: 0, par4: 0, par5: 1 }, // diff 6-12
-  2: { par3: 0, par4: 1, par5: 1 }, // diff 13-16  (confirmed by spec)
+  1: { par3: 0, par4: 1, par5: 0 }, // diff 6-12
+  2: { par3: 0, par4: 1, par5: 1 }, // diff 13-16
   3: { par3: 1, par4: 1, par5: 1 }, // diff 17-23
-  4: { par3: 1, par4: 1, par5: 2 }, // diff 24-30
-  5: { par3: 1, par4: 2, par5: 2 }, // diff 31-35 (and above)
+  4: { par3: 1, par4: 2, par5: 1 }, // diff 24-30
+  5: { par3: 1, par4: 2, par5: 2 }, // diff 31+
 };
 
 // Level thresholds keyed by the UPPER bound of each band (spec rule #5).
@@ -151,12 +151,24 @@ export function validateCourse(course) {
  */
 export function settleHole(rows, stake) {
   const res = {};
-  const valid = (rows || []).filter((r) => r && r.net != null);
+  const valid = (rows || []).filter((r) => r && (r.give_up || r.net != null));
   valid.forEach((r) => (res[r.name] = 0));
   for (let i = 0; i < valid.length; i++) {
     for (let j = i + 1; j < valid.length; j++) {
       const a = valid[i];
       const b = valid[j];
+      // give up (g) = loses to everyone; two give-ups tie
+      if (a.give_up && b.give_up) continue;
+      if (a.give_up) {
+        res[a.name] -= stake;
+        res[b.name] += stake;
+        continue;
+      }
+      if (b.give_up) {
+        res[b.name] -= stake;
+        res[a.name] += stake;
+        continue;
+      }
       if (a.net < b.net) {
         res[a.name] += stake;
         res[b.name] -= stake;
@@ -167,6 +179,17 @@ export function settleHole(rows, stake) {
     }
   }
   return res;
+}
+
+/** Emoji for a hole result vs par (gross == null means gave up). */
+export function scoreEmoji(gross, par) {
+  if (gross == null || par == null) return "🏳️"; // give up / unknown
+  const d = gross - par;
+  if (d <= -2) return "🦅"; // eagle or better
+  if (d === -1) return "🐦"; // birdie
+  if (d === 0) return "⚪"; // par
+  if (d === 1) return "🚂"; // bogey
+  return "😭"; // double bogey or worse
 }
 
 /**

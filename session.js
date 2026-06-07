@@ -12,7 +12,7 @@ import {
   parseBulkScores,
   lookupPresetCourse,
 } from "./parser.js";
-import { settleHole, settleGame } from "./engine.js";
+import { settleHole, settleGame, scoreEmoji } from "./engine.js";
 import { findCustomCourse, rememberCourse } from "./courseStore.js";
 import { saveRound } from "./db.js";
 import { emptyEnvelope } from "./handler.js";
@@ -51,11 +51,11 @@ function maybeStartRound(game) {
 
 const WELCOME_TH =
   "สวัสดีครับ ผมแคดดี้บอท ⛳\n" +
-  "พิมพ์ “สร้างเกม 4 คน” เพื่อเริ่ม\n" +
+  "พิมพ์ “สร้างเกม 4 คน” (ระบุจำนวนคนด้วย) เพื่อเริ่ม\n" +
   "กรอกพาร์สนาม: “454354434 443535444”\n" +
   "เข้าร่วม: “เข้าร่วม แซม 105 90 91”\n" +
   "ลงแต้ม: “หลุม 1 A 5 B 6” หรือ “H1 แซม 4”\n" +
-  "สรุปเงิน: “รวม 18” · จบเกม: “จบเกม”";
+  "สรุปเงิน: “รวม 18” · จบเกม: “จบเกม";
 
 export function welcomeMessage() {
   return WELCOME_TH;
@@ -76,7 +76,7 @@ export function dispatch(text, sourceId, store) {
     store.cancelGame(sourceId);
     const env = emptyEnvelope();
     env.action = "cancel";
-    env.summary = { ok: true, message: "ยกเลิกเกมแล้ว — พิมพ์ “สร้างเกม” เพื่อเริ่มใหม่" };
+    env.summary = { ok: true, message: "ยกเลิกเกมแล้ว — พิมพ์ “สร้างเกม 4 คน” เพื่อเริ่มใหม่" };
     return env;
   }
 
@@ -96,6 +96,15 @@ export function dispatch(text, sourceId, store) {
 
   if (intent === "create_game") {
     const { expected_players } = parseCreateGame(text);
+    if (!expected_players) {
+      const env = emptyEnvelope();
+      env.action = "create_game";
+      env.summary = {
+        ok: false,
+        message: 'ระบุจำนวนผู้เล่นด้วยครับ เช่น “สร้างเกม 4 คน”',
+      };
+      return env;
+    }
     const game = store.createGame(sourceId, { expected_players });
     const env = emptyEnvelope();
     env.action = "create_game";
@@ -106,8 +115,7 @@ export function dispatch(text, sourceId, store) {
       expected_players,
       setup: "course",
       message:
-        `สร้างห้อง ${game.room_code} แล้ว ✅` +
-        (expected_players ? ` (${expected_players} คน)` : "") +
+        `สร้างห้อง ${game.room_code} แล้ว ✅ (${expected_players} คน)` +
         `\nสนามชื่ออะไรครับ? (พิมพ์ชื่อสนาม)`,
     };
     return env;
@@ -168,7 +176,7 @@ export function dispatch(text, sourceId, store) {
         message:
           r.error === "room_not_found"
             ? "ไม่พบห้อง — พิมพ์ “สร้างเกม” ก่อน หรือใส่รหัสห้องให้ถูกต้อง"
-            : "ต้องมีชื่อและสกอร์ 3 รอบ เช่น “เข้าร่วม แซม 105 90 91”",
+            : "ต้องมีชื่อและสกอร์ 3 รอบ เช่น “เข้าร่วม แซม 105 90 91",
       };
       return env;
     }
@@ -203,7 +211,7 @@ export function dispatch(text, sourceId, store) {
         message:
           r.error === "room_not_found"
             ? "ยังไม่มีเกมในกลุ่มนี้ — พิมพ์ “สร้างเกม” ก่อน"
-            : "อ่านหมายเลขหลุมไม่ได้ เช่น “หลุม 1 A 5 B 6”",
+            : "อ่านหมายเลขหลุมไม่ได้ เช่น “หลุม 1 A 5 B 6",
       };
       return env;
     }
@@ -379,7 +387,7 @@ export function dispatch(text, sourceId, store) {
   env.summary = {
     ok: false,
     message:
-      "พิมพ์ “สร้างเกม”, “กรอกพาร์ 454354434 443535444”, “เข้าร่วม แซม 105 90 91”, หรือ “หลุม 1 A 5 B 6”",
+      "พิมพ์ “สร้างเกม”, “กรอกพาร์ 454354434 443535444”, “เข้าร่วม แซม 105 90 91”, หรือ “หลุม 1 A 5 B 6",
   };
   return env;
 }
@@ -399,7 +407,7 @@ function handleSetupAnswer(text, sourceId, store, game) {
         env.summary = {
           ok: false,
           step: "course",
-          message: "พาร์ต้องเป็นเลข 3–6 ครบ 18 หลุม เช่น “Kbsc 454435434 435444354”",
+          message: "พาร์ต้องเป็นเลข 3–6 ครบ 18 หลุม เช่น “Kbsc 454435434 435444354",
         };
         return env;
       }
@@ -420,7 +428,7 @@ function handleSetupAnswer(text, sourceId, store, game) {
       env.summary = {
         ok: false,
         step: "course",
-        message: "ใส่ชื่อสนามด้วยครับ เช่น “Kbsc 454435434 435444354”",
+        message: "ใส่ชื่อสนามด้วยครับ เช่น “Kbsc 454435434 435444354",
       };
       return env;
     }
@@ -456,7 +464,7 @@ function handleSetupAnswer(text, sourceId, store, game) {
       env.summary = {
         ok: false,
         step: "await_pars",
-        message: "พาร์ต้องเป็นเลข 3–6 ครบ 18 หลุม — กรอกใหม่ เช่น “454354434 443535444”",
+        message: "พาร์ต้องเป็นเลข 3–6 ครบ 18 หลุม — กรอกใหม่ เช่น “454354434 443535444",
       };
       return env;
     }
@@ -495,7 +503,7 @@ function handleSetupAnswer(text, sourceId, store, game) {
       env.summary = {
         ok: true,
         step: "await_pars",
-        message: "ได้ครับ กรอกพาร์สนามใหม่อีกครั้ง เช่น “454354434 443535444”",
+        message: "ได้ครับ กรอกพาร์สนามใหม่อีกครั้ง เช่น “454354434 443535444",
       };
       return env;
     }
