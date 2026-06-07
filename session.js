@@ -218,7 +218,7 @@ export function dispatch(text, sourceId, store) {
     const game = r.game;
     const hole = r.hole;
     const rows = game.holes[hole] || [];
-    const registered = game.players.map((p) => p.name);
+    const registered = game.players.map((p) => p.name).filter(Boolean);
     const waiting = registered.filter((n) => !rows.some((x) => x.name === n));
     const complete = registered.length > 0 && waiting.length === 0;
     env.players = rows;

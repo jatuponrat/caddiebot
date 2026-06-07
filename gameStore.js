@@ -221,17 +221,19 @@ export class GameStore {
   join(sourceId, { room_code, player, scores }) {
     const game = this._resolve(room_code, sourceId);
     if (!game) return { ok: false, error: "room_not_found" };
-    if (!player || !Array.isArray(scores) || scores.length !== 3) {
+    const cleanName = typeof player === "string" ? player.trim() : player;
+    if (!cleanName || !Array.isArray(scores) || scores.length !== 3) {
       return { ok: false, error: "need_name_and_3_scores", game };
     }
+    const player_ = cleanName;
     const h = calculateHandicap(scores);
-    const existing = game.players.find((p) => p.name === player);
+    const existing = game.players.find((p) => p.name === player_);
     if (existing) {
       existing.scores = scores.slice(-3);
       existing.handicap_index = h.handicap_index;
     } else {
       game.players.push({
-        name: player,
+        name: player_,
         scores: scores.slice(-3),
         handicap_index: h.handicap_index,
       });
