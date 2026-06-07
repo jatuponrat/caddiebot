@@ -218,20 +218,18 @@ export function settleHoleHeadEatsTail(rows, stake) {
   const n = sorted.length;
   const netOf = (i) => (sorted[i].give_up ? Infinity : sorted[i].net);
 
-  const isUnique = (index) => {
-    const cur = netOf(index);
-    const prev = index > 0 ? netOf(index - 1) : null;
-    const next = index < n - 1 ? netOf(index + 1) : null;
-    return cur !== prev && cur !== next;
-  };
-
+  // ชนตัดเจ๊า: cancel ONLY when the two paired players tie each other.
+  // Ties between non-paired adjacent players do NOT cancel other pairings.
   for (let i = 0; i < Math.floor(n / 2); i++) {
     const headIdx = i;
     const tailIdx = n - 1 - i;
-    if (isUnique(headIdx) && isUnique(tailIdx)) {
+    const headNet = netOf(headIdx);
+    const tailNet = netOf(tailIdx);
+    if (headNet !== tailNet) {
       res[sorted[headIdx].name] += stake; // head (lower net) wins
       res[sorted[tailIdx].name] -= stake; // tail (higher net) loses
     }
+    // else: ชนตัดเจ๊า — this specific pair ties, pairing void
   }
 
   return res;

@@ -450,6 +450,44 @@ test("หัวกินหาง: per-hole and รวม 18 use head-eats-tail 
   assert.equal(s.summary.per_player.D, -20);
 });
 
+test("หัวกินหาง: level strokes applied to ranking (receiver with equal gross wins)", () => {
+  // A=80 (best/giver), B=95 (receiver), diff=15 -> level 2: par4+1, par5+1
+  // Hole 1 = par 4; both score gross 5 -> A.net=5, B.net=4 -> B ranked higher
+  // หัวกินหาง 2-player: B(head) beats A(tail)
+  const store = new GameStore();
+  const G = "Ghet2";
+  dispatch("สร้างเกม 2 คน", G, store);
+  dispatch("The Pine", G, store);
+  dispatch("20", G, store);
+  dispatch("ไม่มี", G, store); // -> format step
+  dispatch("2", G, store); // หัวกินหาง
+  dispatch("เข้าร่วม A 80 80 80", G, store); // hc 80 giver
+  dispatch("เข้าร่วม B 95 95 95", G, store); // hc 95 receiver, diff=15, level 2
+  const h = dispatch("หลุม 1 A 5 B 5", G, store); // equal gross; B.net=4 (gets 1 stroke)
+  assert.equal(h.summary.net_computed, true);
+  // B should win because B.net(4) < A.net(5)
+  assert.equal(h.summary.money.B, 20);
+  assert.equal(h.summary.money.A, -20);
+});
+
+test("กินกันทุกคน: level strokes applied to ranking (receiver with equal gross wins)", () => {
+  // A=80 (giver), B=95 (receiver), diff=15 -> level 2: par4+1
+  // Hole 1 = par 4; A.gross=5 A.net=5, B.gross=5 B.net=4 -> B wins pairwise
+  const store = new GameStore();
+  const G = "Gavall2";
+  dispatch("สร้างเกม 2 คน", G, store);
+  dispatch("The Pine", G, store);
+  dispatch("20", G, store);
+  dispatch("ไม่มี", G, store); // -> format step
+  dispatch("1", G, store); // กินกันทุกคน
+  dispatch("เข้าร่วม A 80 80 80", G, store);
+  dispatch("เข้าร่วม B 95 95 95", G, store);
+  const h = dispatch("หลุม 1 A 5 B 5", G, store); // equal gross; B.net=4
+  assert.equal(h.summary.net_computed, true);
+  assert.equal(h.summary.money.B, 20);
+  assert.equal(h.summary.money.A, -20);
+});
+
 test("custom course via name+par: confirm then saved & usable", () => {
   const store = new GameStore();
   const G = "Gcustom";

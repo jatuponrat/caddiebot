@@ -63,8 +63,24 @@ test("settleHoleHeadEatsTail: odd players -> middle รอด", () => {
   assert.equal(res.C, -20);
 });
 
+test("settleHoleHeadEatsTail: head group ties each other but not tail -> position-1 still wins", () => {
+  // sorted: A(2) B(2) C(2) D(2) E(4)
+  // Pair i=0: A(2) vs E(4): different -> fires, A wins
+  // Pair i=1: B(2) vs D(2): tied -> ชนตัดเจ๊า
+  // C: middle รอด
+  const res = settleHoleHeadEatsTail(
+    [{ name: "A", net: 2 }, { name: "B", net: 2 }, { name: "C", net: 2 }, { name: "D", net: 2 }, { name: "E", net: 4 }],
+    20
+  );
+  assert.equal(res.A, 20);
+  assert.equal(res.B, 0);
+  assert.equal(res.C, 0);
+  assert.equal(res.D, 0);
+  assert.equal(res.E, -20);
+});
+
 test("settleHoleHeadEatsTail: give_up treated as worst score", () => {
-  // A(4) B(5) C=giveup: sorted A B C(Inf) -> A vs C: A unique, C unique (prev=B(5)!=Inf, next=null) -> fires
+  // A(4) B(5) C=giveup: sorted A B C(Inf) -> A vs C: fires (4 != Inf)
   const res = settleHoleHeadEatsTail(
     [{ name: "A", net: 4 }, { name: "B", net: 5 }, { name: "C", give_up: true }],
     20
