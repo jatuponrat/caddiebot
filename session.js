@@ -201,10 +201,32 @@ export function dispatch(text, sourceId, store) {
 
   if (intent === "hole_scores") {
     const parsed = parseHoleScores(text);
-    const r = store.recordHole(sourceId, parsed);
     const env = emptyEnvelope();
     env.action = "hole_scores";
     env.hole = parsed.hole;
+
+    // Reject scores submitted under a name that isn't in the registered roster.
+    // "ไม่ต้องแจ้งรับ" — don't confirm; only warn and stop.
+    const activeGame = store.activeGame(sourceId);
+    if (activeGame && parsed.players && parsed.players.length > 0) {
+      const registered = activeGame.players.map((p) => p.name).filter(Boolean);
+      if (registered.length > 0) {
+        const unknown = parsed.players
+          .map((p) => p.name)
+          .filter((n) => n && !registered.includes(n));
+        if (unknown.length > 0) {
+          env.summary = {
+            ok: false,
+            message:
+              `ไม่พบชื่อ "${unknown.join(", ")}" — กรุณาพิมพ์ชื่อให้ตรงกับที่ลงทะเบียน\n` +
+              `(ชื่อที่ลงทะเบียน: ${registered.join(", ")})`,
+          };
+          return env;
+        }
+      }
+    }
+
+    const r = store.recordHole(sourceId, parsed);
     if (!r.ok) {
       env.summary = {
         ok: false,
@@ -584,7 +606,9 @@ function handleSetupAnswer(text, sourceId, store, game) {
         `ตั้งค่าเกมเรียบร้อย ✅\n` +
         `สนาม ${g.course_name} · หลุมละ ${g.stake} · ${turboLine}\n` +
         `กติกา: ${formatLabel}\n` +
-        `ต่อไป:\n• กรอกพาร์: 454354434 443535444\n• ผู้เล่นพิมพ์: เข้าร่วม แซม 105 90 91`,
+        `ต่อไป:\n` +
+        (g.course ? '' : '• กรอกพาร์: 454354434 443535444\n') +
+        `• ผู้เล่นพิมพ์: เข้าร่วม แซม 105 90 91`,
     };
     return env;
   }

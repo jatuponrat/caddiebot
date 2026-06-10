@@ -522,6 +522,29 @@ test("saved course is remembered and reusable in a later game (by name)", () => 
   assert.match(out.summary.message, /โหลดพาร์ 72/);
 });
 
+test("hole_scores: wrong name rejected with warning, correct names still listed", () => {
+  const store = new GameStore();
+  const G = "GwrongName";
+  dispatch("สร้างเกม 2 คน", G, store);
+  dispatch("The Pine", G, store);
+  dispatch("20", G, store);
+  dispatch("ไม่มี", G, store);
+  dispatch("1", G, store); // กินกันทุกคน
+  dispatch("เข้าร่วม เรียว 90 90 90", G, store);
+  dispatch("เข้าร่วม Honey 90 90 90", G, store);
+
+  // someone types "เ" (just the leading vowel) instead of "เรียว"
+  const out = dispatch("หลุม 1 เ 4", G, store);
+  assert.equal(out.summary.ok, false);
+  assert.match(out.summary.message, /ไม่พบชื่อ/);
+  assert.match(out.summary.message, /เรียว/); // listed the registered names
+
+  // the bad submission must NOT have been recorded — hole is still waiting for both
+  const g = store.activeGame(G);
+  const rows = g.holes[1] || [];
+  assert.equal(rows.length, 0, "no rows should be recorded for an unknown name");
+});
+
 test("custom course: invalid pars rejected; bare pars at course step need a name", () => {
   const store = new GameStore();
   const G = "Gcustom2";
