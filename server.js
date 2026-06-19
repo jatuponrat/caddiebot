@@ -116,8 +116,13 @@ if (isMain) {
     if (dbEnabled()) {
       const ok = await initDb();
       if (ok) {
-        const n = await loadCoursesFromDb();
-        console.log(`[caddiebot] DB ready — loaded ${n} saved course(s)`);
+        const [courses, sessions] = await Promise.all([
+          loadCoursesFromDb(),
+          store.loadFromDb(),
+        ]);
+        console.log(
+          `[caddiebot] DB ready — loaded ${courses} course(s), ${sessions} active session(s)`
+        );
       } else {
         console.warn("[caddiebot] DB configured but init failed — running in-memory");
       }

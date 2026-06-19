@@ -11,6 +11,7 @@ import {
   computeNet,
   validateCourse,
 } from "./engine.js";
+import { saveSession, deleteSession, loadActiveSessions } from "./db.js";
 
 const SESSION_TTL_MS = 6 * 60 * 60 * 1000; // a game/session stays alive 6 hours
 const TURBO_HOLES = [9, 18]; // closing hole of each nine
@@ -19,6 +20,35 @@ export class GameStore {
   constructor() {
     this.rooms = new Map(); // room_code -> game
     this.activeBySource = new Map(); // sourceId (groupId/userId) -> room_code
+  }
+
+  /** Fire-and-forget: persist game state to DB (no-op if DB disabled). */
+  _persist(game) {
+    if (!game?.source_id) return;
+    saveSession(game.source_id, game).catch((e) =>
+      console.error("[store] persist error:", e.message)
+    );
+  }
+
+  /** Fire-and-forget: remove session from DB when game ends. */
+  _persistDelete(sourceId) {
+    if (!sourceId) return;
+    deleteSession(sourceId).catch((e) =>
+      console.error("[store] delete error:", e.message)
+    );
+  }
+
+  /** Restore active sessions from DB into memory (call once at startup). */
+  async loadFromDb() {
+    const rows = await loadActiveSessions();
+    let n = 0;
+    for (const { sourceId, game } of rows) {
+      if (!game?.room_code) continue;
+      this.rooms.set(game.room_code, game);
+      if (sourceId) this.activeBySource.set(sourceId, game.room_code);
+      n++;
+    }
+    return n;
   }
 
   _newCode() {
@@ -36,6 +66,7 @@ export class GameStore {
 
   _drop(game) {
     if (!game) return;
+    this._persistDelete(game.source_id); // clean up expired session from DB
     this.rooms.delete(game.room_code);
     if (game.source_id && this.activeBySource.get(game.source_id) === game.room_code) {
       this.activeBySource.delete(game.source_id);
@@ -102,6 +133,7 @@ export class GameStore {
     };
     this.rooms.set(room_code, game);
     if (sourceId) this.activeBySource.set(sourceId, room_code);
+    this._persist(game);
     return game;
   }
 
@@ -123,6 +155,7 @@ export class GameStore {
     if (!game) return { ok: false, error: "no active game" };
     game.course_name = String(name || "").trim() || null;
     game.setup = "stake";
+    this._persist(game);
     return { ok: true, game };
   }
 
@@ -132,6 +165,7 @@ export class GameStore {
     if (!game) return { ok: false, error: "no active game" };
     game.course_name = String(name || "").trim() || null;
     game.setup = "await_pars";
+    this._persist(game);
     return { ok: true, game };
   }
 
@@ -142,6 +176,7 @@ export class GameStore {
     game.course_name = String(name || "").trim() || null;
     game.pending_course = { holes, total };
     game.setup = "confirm_course";
+    this._persist(game);
     return { ok: true, game };
   }
 
@@ -155,6 +190,7 @@ export class GameStore {
     game.pending_course = null;
     game.setup = "stake";
     if (game.rules) this._recomputeNets(game);
+    this._persist(game);
     return { ok: true, game, total };
   }
 
@@ -164,6 +200,7 @@ export class GameStore {
     if (!game) return { ok: false, error: "no active game" };
     game.pending_course = null;
     game.setup = "await_pars";
+    this._persist(game);
     return { ok: true, game };
   }
 
@@ -172,6 +209,7 @@ export class GameStore {
     if (!game) return { ok: false, error: "no active game" };
     game.stake = Number(stake);
     game.setup = "turbo";
+    this._persist(game);
     return { ok: true, game };
   }
 
@@ -181,6 +219,7 @@ export class GameStore {
     game.turbo = Boolean(on);
     game.turbo_holes = on ? [...TURBO_HOLES] : [];
     game.setup = "format"; // advance to กติกา selection
+    this._persist(game);
     return { ok: true, game };
   }
 
@@ -189,20 +228,28 @@ export class GameStore {
     if (!game) return { ok: false, error: "no active game" };
     game.format = format; // "all_vs_all" | "head_tail"
     game.setup = "done";
+    this._persist(game);
     return { ok: true, game };
   }
 
   /** End the setup Q&A early (e.g. when real gameplay begins). */
   finishSetup(sourceId) {
     const game = this._resolve(null, sourceId);
-    if (game) game.setup = "done";
+    if (game) {
+      game.setup = "done";
+      this._persist(game);
+    }
     return game;
   }
 
   cancelGame(sourceId) {
     const game = this._resolve(null, sourceId);
     if (!game) return false;
-    this._drop(game);
+    this._persistDelete(game.source_id); // explicit delete (not via _drop to avoid double-call)
+    this.rooms.delete(game.room_code);
+    if (game.source_id && this.activeBySource.get(game.source_id) === game.room_code) {
+      this.activeBySource.delete(game.source_id);
+    }
     return true;
   }
 
@@ -215,6 +262,7 @@ export class GameStore {
     game.course = course;
     // Retroactively compute net for holes recorded before the course was set.
     if (valid && game.rules) this._recomputeNets(game);
+    this._persist(game);
     return { ok: valid, errors, game };
   }
 
@@ -240,6 +288,7 @@ export class GameStore {
     }
     if (sourceId) this.activeBySource.set(sourceId, game.room_code);
     this._recompute(game);
+    this._persist(game);
     return { ok: true, game, handicap_index: h.handicap_index };
   }
 
@@ -319,6 +368,7 @@ export class GameStore {
     }
 
     if (game.status === "ready") game.status = "in_progress";
+    this._persist(game);
     return { ok: true, game, par, net_computed: canNet, hole: Number(hole) };
   }
 
@@ -349,6 +399,7 @@ export class GameStore {
       else arr.push(row);
     }
     if (game.status === "ready") game.status = "in_progress";
+    this._persist(game);
     return { ok: true, game, name };
   }
 }

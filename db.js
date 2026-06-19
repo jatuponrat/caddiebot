@@ -41,6 +41,14 @@ export async function initDb() {
         created_at  timestamptz DEFAULT now()
       );`);
     await p.query(`
+      CREATE TABLE IF NOT EXISTS sessions (
+        source_id   text PRIMARY KEY,
+        room_code   text NOT NULL,
+        state       jsonb NOT NULL,
+        expires_at  timestamptz NOT NULL,
+        updated_at  timestamptz DEFAULT now()
+      );`);
+    await p.query(`
       CREATE TABLE IF NOT EXISTS rounds (
         id          bigserial PRIMARY KEY,
         room_code   text,
@@ -84,6 +92,52 @@ export async function listCourses() {
     return rows;
   } catch (e) {
     console.error("[db] listCourses error:", e.message);
+    return [];
+  }
+}
+
+/** Upsert the live game state for a source (group/user). Fire-and-forget safe. */
+export async function saveSession(sourceId, game) {
+  const p = await ensurePool();
+  if (!p) return;
+  try {
+    await p.query(
+      `INSERT INTO sessions (source_id, room_code, state, expires_at, updated_at)
+       VALUES ($1, $2, $3, to_timestamp($4 / 1000.0), now())
+       ON CONFLICT (source_id) DO UPDATE
+         SET room_code   = EXCLUDED.room_code,
+             state       = EXCLUDED.state,
+             expires_at  = EXCLUDED.expires_at,
+             updated_at  = now()`,
+      [sourceId, game.room_code, JSON.stringify(game), game.expires_at]
+    );
+  } catch (e) {
+    console.error("[db] saveSession error:", e.message);
+  }
+}
+
+/** Delete a session when a game ends or is cancelled. */
+export async function deleteSession(sourceId) {
+  const p = await ensurePool();
+  if (!p) return;
+  try {
+    await p.query(`DELETE FROM sessions WHERE source_id = $1`, [sourceId]);
+  } catch (e) {
+    console.error("[db] deleteSession error:", e.message);
+  }
+}
+
+/** Load all non-expired sessions from DB. Returns [{sourceId, game}]. */
+export async function loadActiveSessions() {
+  const p = await ensurePool();
+  if (!p) return [];
+  try {
+    const { rows } = await p.query(
+      `SELECT source_id, state FROM sessions WHERE expires_at > now()`
+    );
+    return rows.map((r) => ({ sourceId: r.source_id, game: r.state }));
+  } catch (e) {
+    console.error("[db] loadActiveSessions error:", e.message);
     return [];
   }
 }
