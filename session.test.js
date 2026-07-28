@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { GameStore } from "../gameStore.js";
-import { dispatch, welcomeMessage } from "../session.js";
+import { GameStore, SESSION_TTL_MS } from "./gameStore.js";
+import { dispatch, welcomeMessage, isIdle } from "./session.js";
 
 const par5Hole1 = () =>
   Array.from({ length: 18 }, (_, i) => ({ hole: i + 1, par: i === 0 ? 5 : 4 }));
@@ -62,11 +62,13 @@ test("hole before course is recorded but net is not computed", () => {
   assert.equal("net" in out.players[0], false);
 });
 
-test("join with no game in the group is rejected", () => {
+test("join with no game in the group is ignored silently", () => {
   const store = new GameStore();
   const out = dispatch("เข้าร่วม ชื่อ A 92,95,90", "EmptyGroup", store);
+  assert.equal(out.action, "idle");
   assert.equal(out.summary.ok, false);
-  assert.match(out.summary.message, /ยังไม่มี|ไม่พบห้อง|สร้างเกม/);
+  assert.equal(out.summary.message, "");
+  assert.equal(isIdle(out), true);
 });
 
 test("two groups keep independent games", () => {
@@ -113,11 +115,11 @@ test("par card sets the course and enables net scoring", () => {
   assert.equal(by.B.strokes, 0);
 });
 
-test("par card without a game asks to create one first", () => {
+test("par card without a game is ignored silently", () => {
   const store = new GameStore();
   const out = dispatch("454354434 443535444", "GnoGame", store);
-  assert.equal(out.summary.ok, false);
-  assert.match(out.summary.message, /สร้างเกม/);
+  assert.equal(out.action, "idle");
+  assert.equal(out.summary.message, "");
 });
 
 test("invalid par card asks to re-enter", () => {
@@ -556,4 +558,91 @@ test("custom course: invalid pars rejected; bare pars at course step need a name
   const bare = dispatch("454435434 435444354", G, store); // no name at course step
   assert.equal(bare.summary.ok, false);
   assert.match(bare.summary.message, /ชื่อสนาม/);
+});
+
+// --- 12-hour game lifetime -------------------------------------------------
+
+test("SESSION_TTL_MS is 12 hours", () => {
+  assert.equal(SESSION_TTL_MS, 12 * 60 * 60 * 1000);
+});
+
+test("the 12h deadline is fixed at creation — activity does not extend it", () => {
+  const store = new GameStore();
+  const G = "GttlFixed";
+  const created = dispatch("สร้างเกม 2 คน", G, store);
+  const deadline = store.activeGame(G).expires_at;
+
+  // lots of chatter through the game must not push the deadline out
+  dispatch("Kbsc 454354434 443535444", G, store);
+  dispatch("ยืนยัน", G, store);
+  dispatch("20", G, store);
+  dispatch("ไม่มี", G, store);
+  dispatch("1", G, store);
+  dispatch("เข้าร่วม ชื่อ A 92,95,90", G, store);
+  assert.equal(store.activeGame(G).expires_at, deadline);
+  assert.equal(store.activeGame(G).room_code, created.room_code);
+});
+
+test("after 12h the bot goes silent for everything except สร้างเกม", () => {
+  const store = new GameStore();
+  const G = "GttlExpire";
+  dispatch("สร้างเกม 2 คน", G, store);
+  dispatch("Kbsc2 454354434 443535444", G, store);
+  dispatch("ยืนยัน", G, store);
+  dispatch("20", G, store);
+  dispatch("ไม่มี", G, store);
+  dispatch("1", G, store);
+  dispatch("เข้าร่วม ชื่อ A 92,95,90", G, store);
+  dispatch("เข้าร่วม ชื่อ B 80,82,84", G, store);
+  dispatch("หลุม 1 A 6 B 5", G, store);
+
+  // fast-forward past the 12h deadline
+  store.activeGame(G).expires_at = Date.now() - 1;
+
+  for (const msg of [
+    "หลุม 2 A 5 B 4",
+    "เข้าร่วม ชื่อ C 90,90,90",
+    "รวม 18",
+    "จบเกม",
+    "454354434 443535444",
+    "สวัสดีครับ",
+    "ยืนยัน",
+  ]) {
+    const out = dispatch(msg, G, store);
+    assert.equal(isIdle(out), true, `should stay silent for: ${msg}`);
+    assert.equal(out.summary.message, "");
+  }
+});
+
+test('"สร้างเกม" / "สร้างเกมส์" after expiry starts a completely fresh game', () => {
+  const store = new GameStore();
+  const G = "GttlRestart";
+  const first = dispatch("สร้างเกม 2 คน", G, store);
+  dispatch("เข้าร่วม ชื่อ A 92,95,90", G, store);
+  store.activeGame(G).expires_at = Date.now() - 1;
+
+  // note the ส์ spelling — must work too
+  const again = dispatch("สร้างเกมส์ 3 คน", G, store);
+  assert.equal(again.action, "create_game");
+  assert.equal(again.summary.expected_players, 3);
+
+  const g = store.activeGame(G);
+  assert.equal(g.players.length, 0, "roster must be wiped");
+  assert.deepEqual(g.holes, {});
+  assert.equal(g.course, null);
+  assert.equal(g.stake, null);
+  assert.equal(g.setup, "course");
+  // the old room must be gone from the store entirely
+  assert.equal(store.getGame(first.room_code), null);
+});
+
+test('"สร้างเกม" mid-game also resets everything', () => {
+  const store = new GameStore();
+  const G = "GreCreate";
+  const first = dispatch("สร้างเกม 2 คน", G, store);
+  dispatch("เข้าร่วม ชื่อ A 92,95,90", G, store);
+  const second = dispatch("สร้างเกม 4 คน", G, store);
+  assert.notEqual(second.room_code, first.room_code);
+  assert.equal(store.activeGame(G).players.length, 0);
+  assert.equal(store.getGame(first.room_code), null);
 });
