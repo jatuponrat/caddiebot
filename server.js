@@ -5,7 +5,7 @@
 
 import express from "express";
 import { GameStore } from "./gameStore.js";
-import { dispatch, welcomeMessage } from "./session.js";
+import { dispatch, welcomeMessage, isIdle } from "./session.js";
 import { emptyEnvelope } from "./handler.js";
 import { verifySignature, replyJson, replyText } from "./line.js";
 import { initDb, dbEnabled } from "./db.js";
@@ -70,11 +70,17 @@ export async function processEvent(ev) {
 
   if (ev.message.type === "text") {
     const payload = dispatch(ev.message.text, sourceId, store);
+    // No live game (never started, or expired after 12h) -> total silence.
+    // Only "สร้างเกม" / "สร้างเกมส์" wakes the bot back up.
+    if (isIdle(payload)) return;
     // In a group/room, stay quiet on unrelated chatter so the bot isn't noisy.
     // In 1:1 chat, reply with the help hint.
     if (payload.action === "unknown" && ev.source?.type !== "user") return;
     return replyJson(ev.replyToken, payload, ACCESS_TOKEN); // sends Thai summary.message
   }
+
+  // Non-text messages are only meaningful inside a live game.
+  if (!store.activeGame(sourceId)) return;
 
   if (ev.message.type === "image") {
     // Engine can't OCR. Hand the image off to the AI vision step:

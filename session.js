@@ -67,6 +67,25 @@ export function welcomeMessage() {
   return WELCOME_TH;
 }
 
+/** Envelope meaning "no active game — say nothing at all". The transport layer
+ *  (server.js) must not reply when it sees this action. */
+function idleEnvelope() {
+  const env = emptyEnvelope();
+  env.action = "idle";
+  env.summary = {
+    ok: false,
+    idle: true,
+    reason: "no_active_game",
+    // Empty on purpose: the bot stays completely silent until "สร้างเกม".
+    message: "",
+  };
+  return env;
+}
+
+export function isIdle(payload) {
+  return payload?.action === "idle";
+}
+
 /**
  * @param {string} text - user message
  * @param {string} sourceId - LINE groupId (group chat) or userId (1:1)
@@ -76,6 +95,51 @@ export function welcomeMessage() {
 export function dispatch(text, sourceId, store) {
   const raw = String(text ?? "");
   const intent = detectIntent(text);
+
+  // --- 12h kill switch -----------------------------------------------------
+  // A game expires 12 hours after it was created (see SESSION_TTL_MS). Once
+  // there is no live game for this source, Caddiebot ignores EVERYTHING except
+  // "สร้างเกม" / "สร้างเกมส์", which starts a completely fresh game.
+  const _og = store.activeGame(sourceId);
+  if (!_og && intent !== "create_game") return idleEnvelope();
+
+  // Pending hole-override confirmation (ยืนยัน/ยกเลิก after re-submitting a complete hole)
+  if (_og?.pending_override) {
+    const trimmed = raw.trim();
+    if (/^(ยืนยัน|ใช่|yes|^y)$/i.test(trimmed)) {
+      const { hole, players } = _og.pending_override;
+      _og.pending_override = null;
+      const r = store.recordHole(sourceId, { hole, players });
+      const env = emptyEnvelope();
+      env.action = "hole_scores";
+      env.hole = hole;
+      const rows = r.game.holes[hole] || [];
+      const turbo = Boolean(r.game.turbo && (r.game.turbo_holes || []).includes(hole));
+      const netComputed = Boolean(r.game.rules && r.par != null);
+      const stakeHole = (r.game.stake || 0) * (turbo ? 2 : 1);
+      let holeMoney = null;
+      let moneyLine = "";
+      if (netComputed && r.game.stake) {
+        const settleFn = r.game.format === "head_tail" ? settleHoleHeadEatsTail : settleHole;
+        holeMoney = settleFn(rows, stakeHole);
+        moneyLine = `\n💰 หลุมนี้ (หลุมละ ${stakeHole}): ${fmtMoney(holeMoney)}`;
+      }
+      env.summary = {
+        ok: true, hole, complete: true, par: r.par, net_computed: netComputed,
+        turbo, stake: r.game.stake, money: holeMoney,
+        message: `แก้ไขหลุม ${hole} แล้ว ✅${turbo ? " 🔥" : ""}${moneyLine}`,
+      };
+      return env;
+    }
+    if (/^(ยกเลิก|ไม่|no|^n)$/i.test(trimmed)) {
+      _og.pending_override = null;
+      const env = emptyEnvelope();
+      env.action = "hole_scores";
+      env.summary = { ok: false, message: "ยกเลิกแล้ว — สกอร์เดิมยังคงอยู่" };
+      return env;
+    }
+    // not a yes/no — fall through (pending_override stays until answered)
+  }
 
   // Cancel a game that is mid-setup.
   if (/^\s*(ยกเลิก|cancel)\s*$/i.test(raw) && store.pendingSetup(sourceId)) {
@@ -243,6 +307,23 @@ export function dispatch(text, sourceId, store) {
           };
           return env;
         }
+      }
+    }
+
+    // If this hole is already complete, ask for confirmation before overwriting.
+    if (activeGame) {
+      const existingRows = activeGame.holes[parsed.hole] || [];
+      const regNames = activeGame.players.map((p) => p.name).filter(Boolean);
+      const alreadyDone = regNames.length > 0 && regNames.every((n) => existingRows.some((r) => r.name === n));
+      if (alreadyDone) {
+        activeGame.pending_override = { hole: parsed.hole, players: parsed.players };
+        env.summary = {
+          ok: false,
+          message:
+            `หลุม ${parsed.hole} ส่งครบแล้ว — ยืนยันแก้ไขไหมครับ?\n` +
+            `(พิมพ์ "ยืนยัน" หรือ "ยกเลิก")`,
+        };
+        return env;
       }
     }
 

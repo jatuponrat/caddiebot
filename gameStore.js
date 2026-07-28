@@ -13,29 +13,44 @@ import {
 } from "./engine.js";
 import { saveSession, deleteSession, loadActiveSessions } from "./db.js";
 
-const SESSION_TTL_MS = 6 * 60 * 60 * 1000; // a game/session stays alive 6 hours
+// A game lives 12 hours from the moment it is created — NOT a rolling window.
+// After that the room is dropped and the bot goes silent until someone types
+// "สร้างเกม" / "สร้างเกมส์" to start a brand-new game.
+export const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 const TURBO_HOLES = [9, 18]; // closing hole of each nine
 
 export class GameStore {
   constructor() {
     this.rooms = new Map(); // room_code -> game
     this.activeBySource = new Map(); // sourceId (groupId/userId) -> room_code
+    this._writes = new Map(); // sourceId -> promise chain (serializes DB writes)
   }
 
-  /** Fire-and-forget: persist game state to DB (no-op if DB disabled). */
+  /** Queue a DB write for a source. Writes for the same source_id run in the
+   *  order they were issued, so an expiry DELETE can never land after the
+   *  INSERT of the replacement game created in the same tick. */
+  _queue(sourceId, fn, label) {
+    if (!sourceId) return;
+    const prev = this._writes.get(sourceId) || Promise.resolve();
+    const next = prev
+      .then(fn)
+      .catch((e) => console.error(`[store] ${label} error:`, e.message));
+    this._writes.set(sourceId, next);
+    next.finally(() => {
+      if (this._writes.get(sourceId) === next) this._writes.delete(sourceId);
+    });
+  }
+
+  /** Persist game state to DB (no-op if DB disabled). */
   _persist(game) {
     if (!game?.source_id) return;
-    saveSession(game.source_id, game).catch((e) =>
-      console.error("[store] persist error:", e.message)
-    );
+    const snapshot = JSON.parse(JSON.stringify(game)); // freeze current state
+    this._queue(game.source_id, () => saveSession(game.source_id, snapshot), "persist");
   }
 
-  /** Fire-and-forget: remove session from DB when game ends. */
+  /** Remove session from DB when a game ends or expires. */
   _persistDelete(sourceId) {
-    if (!sourceId) return;
-    deleteSession(sourceId).catch((e) =>
-      console.error("[store] delete error:", e.message)
-    );
+    this._queue(sourceId, () => deleteSession(sourceId), "delete");
   }
 
   /** Restore active sessions from DB into memory (call once at startup). */
@@ -73,13 +88,9 @@ export class GameStore {
     }
   }
 
-  /** Rolling 6h window: any interaction keeps the session alive another 6h. */
-  _touch(game) {
-    if (game) game.expires_at = Date.now() + SESSION_TTL_MS;
-  }
-
   /** Resolve the game for a room_code, falling back to the source's active room.
-   *  Expired games are dropped; valid games are touched (TTL refreshed). */
+   *  Expired games are dropped. The 12h deadline is FIXED at creation time, so
+   *  activity does NOT extend it. */
   _resolve(room_code, sourceId) {
     let game = null;
     if (room_code && this.rooms.has(room_code)) game = this.rooms.get(room_code);
@@ -90,7 +101,6 @@ export class GameStore {
       this._drop(game);
       return null;
     }
-    if (game) this._touch(game);
     return game;
   }
 
@@ -104,6 +114,12 @@ export class GameStore {
   }
 
   createGame(sourceId, { expected_players = null } = {}) {
+    // "สร้างเกม" always starts from a clean slate — discard whatever this
+    // source had before (finished, abandoned or expired).
+    if (sourceId && this.activeBySource.has(sourceId)) {
+      this._drop(this.rooms.get(this.activeBySource.get(sourceId)));
+      this.activeBySource.delete(sourceId);
+    }
     const room_code = this._newCode();
     const now = Date.now();
     const game = {
