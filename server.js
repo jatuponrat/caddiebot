@@ -8,7 +8,7 @@ import { GameStore, SESSION_TTL_MS } from "./gameStore.js";
 import { dispatch, welcomeMessage, isIdle } from "./session.js";
 import { emptyEnvelope } from "./handler.js";
 import { verifySignature, replyJson, replyText } from "./line.js";
-import { initDb, dbEnabled } from "./db.js";
+import { initDb, dbEnabled, dbLastError } from "./db.js";
 import { loadCoursesFromDb } from "./courseStore.js";
 
 const PORT = process.env.PORT || 3000;
@@ -26,15 +26,22 @@ app.use(
   })
 );
 
-// Health + self-diagnosis. Open this in a browser to confirm the two settings
-// that actually keep a round alive are in place:
-//   persistence: true  -> DATABASE_URL is set, live games survive a restart/sleep
-//   keep_alive:   true -> SELF_URL is set, the free instance won't sleep mid-round
+// Health + self-diagnosis. Open this in a browser to confirm persistence is
+// ACTUALLY working, not just configured:
+//   database_url_set: true  -> DATABASE_URL env var is present
+//   db_connected:     true  -> the Postgres connection actually succeeded —
+//                              this is the one that matters. If this is false
+//                              while database_url_set is true, the connection
+//                              string is stale/wrong (e.g. a paused Supabase
+//                              project) and games still die on every sleep.
+//   keep_alive:       true  -> SELF_URL is set, the free instance won't sleep mid-round
 app.get("/health", (_req, res) =>
   res.json({
     ok: true,
     service: "caddiebot-engine",
-    persistence: dbEnabled(), // false = games are lost every time Render sleeps
+    database_url_set: dbEnabled(),
+    db_connected: _dbStatus.connected,
+    db_error: _dbStatus.error,
     keep_alive: Boolean(process.env.SELF_URL),
     session_ttl_hours: SESSION_TTL_MS / 3600000,
     live_games: store.rooms.size,
@@ -76,6 +83,25 @@ app.post("/webhook", async (req, res) => {
 // on Render's free plan, which sleeps after ~15 min idle) found an empty store
 // and the bot went silent — looking exactly like "the game timed out".
 let _ready = null;
+// Surfaced on /health — database_url_set only means the env var is present;
+// db_connected means a real query actually succeeded. A stale/wrong connection
+// string (e.g. a paused Supabase project) shows database_url_set:true,
+// db_connected:false — the games still silently die every time the instance
+// sleeps until this is fixed.
+const _dbStatus = { connected: false, error: null };
+
+async function tryConnectDb() {
+  if (!dbEnabled()) return false;
+  const ok = await initDb();
+  _dbStatus.connected = ok;
+  _dbStatus.error = ok ? null : dbLastError();
+  if (!ok) return false;
+  const [courses, sessions] = await Promise.all([loadCoursesFromDb(), store.loadFromDb()]);
+  console.log(
+    `[caddiebot] DB ready — loaded ${courses} course(s), ${sessions} active session(s)`
+  );
+  return true;
+}
 
 async function bootstrap() {
   if (!dbEnabled()) {
@@ -85,15 +111,22 @@ async function bootstrap() {
     );
     return;
   }
-  const ok = await initDb();
+  const ok = await tryConnectDb();
   if (!ok) {
-    console.warn("[caddiebot] DB configured but init failed — running in-memory");
-    return;
+    console.warn(
+      `[caddiebot] DB configured but init failed (${_dbStatus.error}) — running in-memory. ` +
+        `Will keep retrying every 5 min in case the DB comes back (e.g. an unpaused Supabase project).`
+    );
+    // Self-heal: once the user fixes DATABASE_URL / un-pauses the DB, pick it
+    // up without needing a redeploy.
+    const retry = setInterval(async () => {
+      if (await tryConnectDb()) {
+        console.log("[caddiebot] DB connection recovered.");
+        clearInterval(retry);
+      }
+    }, 5 * 60 * 1000);
+    retry.unref?.();
   }
-  const [courses, sessions] = await Promise.all([loadCoursesFromDb(), store.loadFromDb()]);
-  console.log(
-    `[caddiebot] DB ready — loaded ${courses} course(s), ${sessions} active session(s)`
-  );
 }
 
 export function ready() {

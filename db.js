@@ -5,9 +5,17 @@
 
 let pool = null;
 let poolPromise = null;
+let lastError = null; // set whenever a real connection attempt fails
 
 export function dbEnabled() {
   return Boolean(process.env.DATABASE_URL);
+}
+
+/** The most recent connection failure message, or null if the last attempt
+ *  succeeded (or none has happened yet). Surfaced on /health so a stale/wrong
+ *  DATABASE_URL (e.g. a paused Supabase project) is visible, not silent. */
+export function dbLastError() {
+  return lastError;
 }
 
 async function ensurePool() {
@@ -61,9 +69,11 @@ export async function initDb() {
         settlement  jsonb,
         created_at  timestamptz DEFAULT now()
       );`);
+    lastError = null;
     return true;
   } catch (e) {
     console.error("[db] initDb error:", e.message);
+    lastError = e.message;
     return false;
   }
 }
