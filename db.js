@@ -127,6 +127,23 @@ export async function deleteSession(sourceId) {
   }
 }
 
+/** Load ONE source's non-expired session. Returns the game state, or null.
+ *  Used to re-hydrate a single group after a restart / free-tier spin-down. */
+export async function loadSession(sourceId) {
+  const p = await ensurePool();
+  if (!p || !sourceId) return null;
+  try {
+    const { rows } = await p.query(
+      `SELECT state FROM sessions WHERE source_id = $1 AND expires_at > now()`,
+      [sourceId]
+    );
+    return rows[0]?.state ?? null;
+  } catch (e) {
+    console.error("[db] loadSession error:", e.message);
+    return null;
+  }
+}
+
 /** Load all non-expired sessions from DB. Returns [{sourceId, game}]. */
 export async function loadActiveSessions() {
   const p = await ensurePool();

@@ -4,7 +4,7 @@
 // through the stateful session dispatcher; the bot replies in Thai.
 
 import express from "express";
-import { GameStore } from "./gameStore.js";
+import { GameStore, SESSION_TTL_MS } from "./gameStore.js";
 import { dispatch, welcomeMessage, isIdle } from "./session.js";
 import { emptyEnvelope } from "./handler.js";
 import { verifySignature, replyJson, replyText } from "./line.js";
@@ -26,7 +26,22 @@ app.use(
   })
 );
 
-app.get("/health", (_req, res) => res.json({ ok: true, service: "caddiebot-engine" }));
+// Health + self-diagnosis. Open this in a browser to confirm the two settings
+// that actually keep a round alive are in place:
+//   persistence: true  -> DATABASE_URL is set, live games survive a restart/sleep
+//   keep_alive:   true -> SELF_URL is set, the free instance won't sleep mid-round
+app.get("/health", (_req, res) =>
+  res.json({
+    ok: true,
+    service: "caddiebot-engine",
+    persistence: dbEnabled(), // false = games are lost every time Render sleeps
+    keep_alive: Boolean(process.env.SELF_URL),
+    session_ttl_hours: SESSION_TTL_MS / 3600000,
+    live_games: store.rooms.size,
+    uptime_min: Math.round(process.uptime() / 60), // small number = just cold-started
+    started_at: new Date(Date.now() - process.uptime() * 1000).toISOString(),
+  })
+);
 
 // One game per LINE source: group > room > 1:1 user.
 function sourceIdOf(source = {}) {
@@ -55,7 +70,39 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
+// --- startup / state restore ------------------------------------------------
+// The DB restore MUST finish before we answer webhooks. Previously it ran inside
+// the listen() callback, so a message arriving during a cold start (very common
+// on Render's free plan, which sleeps after ~15 min idle) found an empty store
+// and the bot went silent — looking exactly like "the game timed out".
+let _ready = null;
+
+async function bootstrap() {
+  if (!dbEnabled()) {
+    console.log("[caddiebot] no DATABASE_URL — running in-memory (no persistence)");
+    console.warn(
+      "[caddiebot] WARNING: without DATABASE_URL every restart/sleep wipes live games."
+    );
+    return;
+  }
+  const ok = await initDb();
+  if (!ok) {
+    console.warn("[caddiebot] DB configured but init failed — running in-memory");
+    return;
+  }
+  const [courses, sessions] = await Promise.all([loadCoursesFromDb(), store.loadFromDb()]);
+  console.log(
+    `[caddiebot] DB ready — loaded ${courses} course(s), ${sessions} active session(s)`
+  );
+}
+
+export function ready() {
+  if (!_ready) _ready = bootstrap().catch((e) => console.error("[caddiebot] bootstrap:", e));
+  return _ready;
+}
+
 export async function processEvent(ev) {
+  await ready(); // never serve a webhook from a half-loaded store
   // Bot added to a group/room, or a user adds the bot as a friend -> greet (Thai).
   if ((ev.type === "join" || ev.type === "follow") && ev.replyToken) {
     return replyText(ev.replyToken, welcomeMessage(), ACCESS_TOKEN);
@@ -67,6 +114,13 @@ export async function processEvent(ev) {
 
   if (ev.type !== "message" || !ev.replyToken) return;
   const sourceId = sourceIdOf(ev.source);
+
+  // Cold in-memory cache? Try to re-hydrate this group's game from the DB before
+  // deciding there's no live game. Without this, a restart mid-round silently
+  // killed the game even though the state was still in Postgres.
+  if (sourceId && !store.activeGame(sourceId)) {
+    await store.restoreSource(sourceId).catch(() => null);
+  }
 
   if (ev.message.type === "text") {
     const payload = dispatch(ev.message.text, sourceId, store);
@@ -115,26 +169,29 @@ app.post("/simulate", (req, res) => {
   res.json(dispatch(text ?? "", sourceId ?? "sim-default", store));
 });
 
+// Render's free plan spins the instance down after ~15 min without traffic — and
+// a golf group goes quiet far longer than that between holes. Pinging our own
+// /health keeps the process (and the in-memory game) alive during a round.
+// Set SELF_URL to the Render URL, e.g. https://caddiebot.onrender.com
+function startKeepAlive() {
+  const url = (process.env.SELF_URL || "").replace(/\/+$/, "");
+  if (!url) {
+    console.warn("[caddiebot] SELF_URL not set — no keep-alive ping (instance may sleep).");
+    return;
+  }
+  const every = Number(process.env.KEEPALIVE_MS || 10 * 60 * 1000);
+  setInterval(() => {
+    fetch(`${url}/health`).catch(() => {});
+  }, every).unref?.();
+  console.log(`[caddiebot] keep-alive pinging ${url}/health every ${Math.round(every / 60000)}m`);
+}
+
 const isMain = process.argv[1] && import.meta.url === `file://${process.argv[1]}`;
 if (isMain) {
   app.listen(PORT, async () => {
     console.log(`[caddiebot] webhook listening on :${PORT}`);
-    if (dbEnabled()) {
-      const ok = await initDb();
-      if (ok) {
-        const [courses, sessions] = await Promise.all([
-          loadCoursesFromDb(),
-          store.loadFromDb(),
-        ]);
-        console.log(
-          `[caddiebot] DB ready — loaded ${courses} course(s), ${sessions} active session(s)`
-        );
-      } else {
-        console.warn("[caddiebot] DB configured but init failed — running in-memory");
-      }
-    } else {
-      console.log("[caddiebot] no DATABASE_URL — running in-memory (no persistence)");
-    }
+    await ready();
+    startKeepAlive();
   });
 }
 

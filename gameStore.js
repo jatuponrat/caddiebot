@@ -11,11 +11,13 @@ import {
   computeNet,
   validateCourse,
 } from "./engine.js";
-import { saveSession, deleteSession, loadActiveSessions } from "./db.js";
+import { saveSession, deleteSession, loadActiveSessions, loadSession } from "./db.js";
 
-// A game lives 12 hours from the moment it is created — NOT a rolling window.
-// After that the room is dropped and the bot goes silent until someone types
-// "สร้างเกม" / "สร้างเกมส์" to start a brand-new game.
+// ROLLING 12-hour window: a game stays alive for 12 hours after the LAST
+// activity (setup answer, join, hole score, settle...). Every action pushes the
+// deadline out, so a round can never expire while people are still playing —
+// only 12 hours of complete silence kills it. After that the room is dropped
+// and the bot ignores everything until someone types "สร้างเกม" / "สร้างเกมส์".
 export const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 const TURBO_HOLES = [9, 18]; // closing hole of each nine
 
@@ -41,8 +43,12 @@ export class GameStore {
     });
   }
 
-  /** Persist game state to DB (no-op if DB disabled). */
+  /** Persist game state to DB (no-op if DB disabled). Every persist is a real
+   *  game action (setup answer, join, score, edit), so this is also where the
+   *  rolling TTL is renewed — plain group chatter never gets here and therefore
+   *  never extends the deadline. */
   _persist(game) {
+    this.touch(game);
     if (!game?.source_id) return;
     const snapshot = JSON.parse(JSON.stringify(game)); // freeze current state
     this._queue(game.source_id, () => saveSession(game.source_id, snapshot), "persist");
@@ -88,9 +94,20 @@ export class GameStore {
     }
   }
 
+  /** Rolling TTL: a real game action pushes the deadline to 12h from NOW.
+   *  Field-only — the caller (_persist) does the DB write, so this can never
+   *  recurse. Idle chatter does NOT come through here on purpose: golf groups
+   *  keep talking for days after a round and a stale game must still die. */
+  touch(game) {
+    if (!game) return game;
+    const now = Date.now();
+    game.expires_at = now + SESSION_TTL_MS;
+    game.last_active_at = now;
+    return game;
+  }
+
   /** Resolve the game for a room_code, falling back to the source's active room.
-   *  Expired games are dropped. The 12h deadline is FIXED at creation time, so
-   *  activity does NOT extend it. */
+   *  Expired games are dropped. Reading alone does NOT renew the TTL. */
   _resolve(room_code, sourceId) {
     let game = null;
     if (room_code && this.rooms.has(room_code)) game = this.rooms.get(room_code);
@@ -104,12 +121,37 @@ export class GameStore {
     return game;
   }
 
+  /** Re-hydrate ONE source's game from the DB (used when the in-memory cache is
+   *  cold — e.g. Render restarted or the free instance was spun down mid-round).
+   *  Returns the live game, or null if there is none / it expired. */
+  async restoreSource(sourceId) {
+    if (!sourceId) return null;
+    if (this.activeBySource.has(sourceId)) return this._resolve(null, sourceId);
+    const game = await loadSession(sourceId);
+    if (!game?.room_code) return null;
+    if (this._expired(game)) {
+      this._persistDelete(sourceId);
+      return null;
+    }
+    game.source_id = game.source_id || sourceId;
+    this.rooms.set(game.room_code, game);
+    this.activeBySource.set(sourceId, game.room_code);
+    return game;
+  }
+
   getGame(room_code) {
     const game = this.rooms.get(room_code) || null;
     if (this._expired(game)) {
       this._drop(game);
       return null;
     }
+    return game;
+  }
+
+  /** Force a state save. session.js mutates game objects directly (current_hole,
+   *  pending_override); without this those edits vanish on restart. */
+  save(game) {
+    this._persist(game);
     return game;
   }
 
@@ -145,7 +187,8 @@ export class GameStore {
       holes: {}, // holeNumber -> [{ name, gross, strokes?, net? }]
       current_hole: null, // the hole the round is waiting on (set when roster is full)
       created_at: now,
-      expires_at: now + SESSION_TTL_MS,
+      last_active_at: now,
+      expires_at: now + SESSION_TTL_MS, // rolling: renewed on every action
     };
     this.rooms.set(room_code, game);
     if (sourceId) this.activeBySource.set(sourceId, room_code);

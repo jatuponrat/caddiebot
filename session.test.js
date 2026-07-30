@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { GameStore, SESSION_TTL_MS } from "./gameStore.js";
-import { dispatch, welcomeMessage, isIdle } from "./session.js";
+import { GameStore, SESSION_TTL_MS } from "../gameStore.js";
+import { dispatch, welcomeMessage, isIdle } from "../session.js";
 
 const par5Hole1 = () =>
   Array.from({ length: 18 }, (_, i) => ({ hole: i + 1, par: i === 0 ? 5 : 4 }));
@@ -221,7 +221,7 @@ test("turbo hole is flagged when recording scores", () => {
   assert.equal(n.summary.turbo, false);
 });
 
-test("session expires after its TTL (6h)", () => {
+test("session expires after its TTL (12h idle)", () => {
   const store = new GameStore();
   const G = "Gttl";
   const code = dispatch("สร้างเกม 2 คน", G, store).room_code;
@@ -566,21 +566,76 @@ test("SESSION_TTL_MS is 12 hours", () => {
   assert.equal(SESSION_TTL_MS, 12 * 60 * 60 * 1000);
 });
 
-test("the 12h deadline is fixed at creation — activity does not extend it", () => {
+test("the 12h deadline ROLLS — every action pushes it 12h from now", () => {
   const store = new GameStore();
-  const G = "GttlFixed";
+  const G = "GttlRolling";
   const created = dispatch("สร้างเกม 2 คน", G, store);
-  const deadline = store.activeGame(G).expires_at;
 
-  // lots of chatter through the game must not push the deadline out
+  // pretend the group has been quiet for 11 hours: 1h left on the clock
+  const g0 = store.rooms.get(created.room_code);
+  g0.expires_at = Date.now() + 60 * 60 * 1000;
+
+  // any activity must renew the full 12h window
   dispatch("Kbsc 454354434 443535444", G, store);
   dispatch("ยืนยัน", G, store);
   dispatch("20", G, store);
   dispatch("ไม่มี", G, store);
   dispatch("1", G, store);
   dispatch("เข้าร่วม ชื่อ A 92,95,90", G, store);
-  assert.equal(store.activeGame(G).expires_at, deadline);
-  assert.equal(store.activeGame(G).room_code, created.room_code);
+
+  const g = store.activeGame(G);
+  assert.equal(g.room_code, created.room_code);
+  const remaining = g.expires_at - Date.now();
+  assert.ok(
+    remaining > SESSION_TTL_MS - 5000 && remaining <= SESSION_TTL_MS,
+    `deadline should be ~12h out, got ${remaining}ms`
+  );
+});
+
+test("plain group chatter does NOT extend the deadline", () => {
+  const store = new GameStore();
+  const G = "GttlChatter";
+  dispatch("สร้างเกม 2 คน", G, store);
+  dispatch("Kbsc8 454354434 443535444", G, store);
+  dispatch("ยืนยัน", G, store);
+  dispatch("20", G, store);
+  dispatch("ไม่มี", G, store);
+  dispatch("1", G, store);
+  dispatch("เข้าร่วม ชื่อ A 92,95,90", G, store);
+  dispatch("เข้าร่วม ชื่อ B 80,82,84", G, store);
+
+  // pretend the round finished 11h ago: 1h left, then the group just chats
+  const deadline = Date.now() + 60 * 60 * 1000;
+  store.activeGame(G).expires_at = deadline;
+  for (const msg of ["ไปกินข้าวกันไหม", "555", "อาทิตย์หน้าว่างไหม", "ok"]) {
+    dispatch(msg, G, store);
+  }
+  assert.equal(
+    store.activeGame(G).expires_at,
+    deadline,
+    "chatter must not renew a stale game"
+  );
+});
+
+test("a long round never expires mid-play (hole scores renew the window)", () => {
+  const store = new GameStore();
+  const G = "GttlLongRound";
+  dispatch("สร้างเกม 2 คน", G, store);
+  dispatch("Kbsc9 454354434 443535444", G, store);
+  dispatch("ยืนยัน", G, store);
+  dispatch("20", G, store);
+  dispatch("ไม่มี", G, store);
+  dispatch("1", G, store);
+  dispatch("เข้าร่วม ชื่อ A 92,95,90", G, store);
+  dispatch("เข้าร่วม ชื่อ B 80,82,84", G, store);
+
+  // simulate a slow 18 holes: before each hole the clock is nearly out
+  for (let h = 1; h <= 18; h++) {
+    store.activeGame(G).expires_at = Date.now() + 1000; // 1s left
+    const out = dispatch(`หลุม ${h} A 5 B 4`, G, store);
+    assert.equal(isIdle(out), false, `hole ${h} must still be accepted`);
+  }
+  assert.equal(Object.keys(store.activeGame(G).holes).length, 18);
 });
 
 test("after 12h the bot goes silent for everything except สร้างเกม", () => {

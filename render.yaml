@@ -16,15 +16,19 @@ services:
         sync: false # prompted in the Render dashboard
       - key: LINE_CHANNEL_ACCESS_TOKEN
         sync: false
-# NOTE: state is in-memory for now, so it resets when the free service sleeps
-# (~15 min idle) or redeploys. When you want persistence, add a Postgres here:
-#
-# databases:
-#   - name: caddiebot-db
-#     plan: free
-#     databaseName: caddiebot
-# and add to envVars:
-#       - key: DATABASE_URL
-#         fromDatabase:
-#           name: caddiebot-db
-#           property: connectionString
+      # Live game state is persisted here. WITHOUT this, the free instance's
+      # ~15 min idle sleep wipes any in-progress round — which looks exactly
+      # like "the game timed out" between every hole.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: caddiebot-db
+          property: connectionString
+      # Self-ping /health every 10 min so the free instance stays awake during
+      # a round (a group goes quiet far longer than 15 min between holes).
+      - key: SELF_URL
+        value: https://caddiebot.onrender.com
+
+databases:
+  - name: caddiebot-db
+    plan: free
+    databaseName: caddiebot

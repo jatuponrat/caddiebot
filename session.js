@@ -37,11 +37,13 @@ function holeAnnounce(game, n) {
   return par != null ? `⛳ หลุม ${n} Par ${par} เริ่ม !!` : `⛳ หลุม ${n} เริ่ม !!`;
 }
 
-/** When the roster is full, kick off hole 1 (or ask for pars first). */
-function maybeStartRound(game) {
+/** When the roster is full, kick off hole 1 (or ask for pars first).
+ *  `store` is optional but should be passed so current_hole is persisted. */
+function maybeStartRound(game, store) {
   if (game.status === "ready" && game.current_hole == null) {
     if (game.course) {
       game.current_hole = 1;
+      store?.save(game);
       return (
         `\n🏁 ผู้เล่นครบแล้ว!\n` +
         `${holeAnnounce(game, 1)}\n` +
@@ -96,10 +98,12 @@ export function dispatch(text, sourceId, store) {
   const raw = String(text ?? "");
   const intent = detectIntent(text);
 
-  // --- 12h kill switch -----------------------------------------------------
-  // A game expires 12 hours after it was created (see SESSION_TTL_MS). Once
-  // there is no live game for this source, Caddiebot ignores EVERYTHING except
-  // "สร้างเกม" / "สร้างเกมส์", which starts a completely fresh game.
+  // --- 12h idle kill switch ------------------------------------------------
+  // A game expires 12 hours after the LAST activity (rolling window — see
+  // SESSION_TTL_MS + GameStore.touch). Reading the game below renews it, so an
+  // in-progress round never dies mid-play. Once there is no live game for this
+  // source, Caddiebot ignores EVERYTHING except "สร้างเกม" / "สร้างเกมส์",
+  // which starts a completely fresh game.
   const _og = store.activeGame(sourceId);
   if (!_og && intent !== "create_game") return idleEnvelope();
 
@@ -109,6 +113,7 @@ export function dispatch(text, sourceId, store) {
     if (/^(ยืนยัน|ใช่|yes|^y)$/i.test(trimmed)) {
       const { hole, players } = _og.pending_override;
       _og.pending_override = null;
+      store.save(_og);
       const r = store.recordHole(sourceId, { hole, players });
       const env = emptyEnvelope();
       env.action = "hole_scores";
@@ -133,6 +138,7 @@ export function dispatch(text, sourceId, store) {
     }
     if (/^(ยกเลิก|ไม่|no|^n)$/i.test(trimmed)) {
       _og.pending_override = null;
+      store.save(_og);
       const env = emptyEnvelope();
       env.action = "hole_scores";
       env.summary = { ok: false, message: "ยกเลิกแล้ว — สกอร์เดิมยังคงอยู่" };
@@ -264,7 +270,7 @@ export function dispatch(text, sourceId, store) {
       message:
         `${parsed.player} เข้าร่วมแล้ว (แต้มต่อ ${r.handicap_index}) ` +
         `— ผู้เล่น ${count}${cap} คน` +
-        maybeStartRound(g),
+        maybeStartRound(g, store),
     };
     return env;
   }
@@ -317,6 +323,7 @@ export function dispatch(text, sourceId, store) {
       const alreadyDone = regNames.length > 0 && regNames.every((n) => existingRows.some((r) => r.name === n));
       if (alreadyDone) {
         activeGame.pending_override = { hole: parsed.hole, players: parsed.players };
+        store.save(activeGame); // survive a restart while waiting for ยืนยัน/ยกเลิก
         env.summary = {
           ok: false,
           message:
@@ -384,6 +391,7 @@ export function dispatch(text, sourceId, store) {
         game.current_hole = null;
         nextLine = `\n🏁 ครบ 18 หลุม! พิมพ์ "รวม 18" หรือ "จบเกม" เพื่อสรุปเงิน`;
       }
+      store.save(game); // current_hole is set directly here — persist it
     }
     env.summary = {
       ok: true,
@@ -415,7 +423,7 @@ export function dispatch(text, sourceId, store) {
       ok: r.ok,
       errors: r.errors,
       message: r.ok
-        ? `บันทึกสนามแล้ว (พาร์รวม ${r.game.course.total_par})` + maybeStartRound(r.game)
+        ? `บันทึกสนามแล้ว (พาร์รวม ${r.game.course.total_par})` + maybeStartRound(r.game, store)
         : "ข้อมูลสนามไม่ครบ 18 หลุม หรือค่าพาร์ผิด",
     };
     return env;
@@ -429,6 +437,7 @@ export function dispatch(text, sourceId, store) {
       env.summary = { ok: false, message: `ไม่มีเกมที่กำลังเล่นอยู่ — พิมพ์ "สร้างเกม" ก่อน` };
       return env;
     }
+    store.save(g); // asking for the money is real activity — renew the 12h window
     const s = settleGame(g);
     env.players = g.players;
     env.summary = {
@@ -501,7 +510,7 @@ export function dispatch(text, sourceId, store) {
       in: r.in,
       message:
         `กรอกพาร์ ${r.total} สำเร็จแล้ว ✅ (OUT ${r.out} / IN ${r.in})${note}` +
-        maybeStartRound(set.game),
+        maybeStartRound(set.game, store),
     };
     return env;
   }
