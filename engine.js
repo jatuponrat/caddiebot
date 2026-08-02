@@ -3,30 +3,39 @@
 // NO money settlement here (spec rule #8): we only structure data for the backend.
 
 /* ----------------------------------------------------------------------------
- * HANDICAP RULES TABLE  (strokes given per hole type, by game handicap level)
+ * HANDICAP RULES TABLE  (strokes given per hole type, by pair handicap level)
  *
- * ⚠️ ONLY level 2 is defined by the spec ({par4:1, par5:1, par3:0}).
- *    Levels 0,1,3,4,5 below are a SENSIBLE DEFAULT and must be confirmed by you.
- *    Edit this table — it is the single source of truth for stroke allocation.
+ * Eight bands, applied to EACH PAIR's own handicap gap. The finer slicing
+ * exists to stop the boundaries lurching: the old six-band table jumped ten
+ * strokes at once (gap 5 -> 0, gap 6 -> 10), which made a single point of
+ * handicap swing a whole round. Worst jump here is six.
+ *
+ * On a par-72 card (4x par3, 10x par4, 4x par5) the round totals are
+ * 0, 4, 10, 14, 18, 22, 28, 32.
+ *
+ * This table is the single source of truth for stroke allocation.
  * -------------------------------------------------------------------------- */
 export const HANDICAP_RULES_TABLE = {
-  0: { par3: 0, par4: 0, par5: 0 }, // diff <= 5  -> even game
-  1: { par3: 0, par4: 1, par5: 0 }, // diff 6-12
-  2: { par3: 0, par4: 1, par5: 1 }, // diff 13-16
-  3: { par3: 1, par4: 1, par5: 1 }, // diff 17-23
-  4: { par3: 1, par4: 2, par5: 1 }, // diff 24-30
-  5: { par3: 1, par4: 2, par5: 2 }, // diff 31+
+  0: { par3: 0, par4: 0, par5: 0 }, // gap 0-2   -> even game
+  1: { par3: 0, par4: 0, par5: 1 }, // gap 3-6
+  2: { par3: 0, par4: 1, par5: 0 }, // gap 7-12
+  3: { par3: 0, par4: 1, par5: 1 }, // gap 13-16
+  4: { par3: 1, par4: 1, par5: 1 }, // gap 17-20
+  5: { par3: 1, par4: 1, par5: 2 }, // gap 21-24
+  6: { par3: 1, par4: 2, par5: 1 }, // gap 25-30
+  7: { par3: 1, par4: 2, par5: 2 }, // gap 31+
 };
 
-// Level thresholds keyed by the UPPER bound of each band (spec rule #5).
-// diff <= 5 -> 0, 6..12 -> 1, 13..16 -> 2, 17..23 -> 3, 24..30 -> 4, 31+ -> 5.
+// Level thresholds keyed by the UPPER bound of each band.
 const LEVEL_BANDS = [
-  { max: 5, level: 0 },
-  { max: 12, level: 1 },
-  { max: 16, level: 2 },
-  { max: 23, level: 3 },
-  { max: 30, level: 4 },
-  { max: Infinity, level: 5 },
+  { max: 2, level: 0 },
+  { max: 6, level: 1 },
+  { max: 12, level: 2 },
+  { max: 16, level: 3 },
+  { max: 20, level: 4 },
+  { max: 24, level: 5 },
+  { max: 30, level: 6 },
+  { max: Infinity, level: 7 },
 ];
 
 /**
@@ -102,31 +111,24 @@ export function strokesForHole(par, rules) {
   return Number(rules[key]) || 0;
 }
 
-const NO_STROKES = { par3: 0, par4: 0, par5: 0 };
-
 /**
- * Stroke rules for ONE pairing, derived from the two players' own gap.
- * The higher handicap_index receives; the lower gives nothing.
- * @returns {{par3:number,par4:number,par5:number}} rules for `hi` vs `lo`
+ * The handicap gap for ONE pairing. The higher index receives; the lower gives.
+ * @returns {number} strokes the weaker player is owed over the round (0 if none)
  */
-export function pairStrokeRules(hi, lo) {
+export function pairGap(hi, lo) {
   const d = Math.round(Number(hi) - Number(lo));
-  if (!Number.isFinite(d) || d <= 0) return { ...NO_STROKES };
-  return classifyHandicapLevel(d).rules;
+  return Number.isFinite(d) && d > 0 ? d : 0;
 }
 
 /**
  * Per-PAIR stroke allocation (not field-relative).
  *
- * Each pairing is classified on its OWN handicap gap, so a player two strokes
- * off the best player receives nothing from them while still giving strokes to
- * a much weaker opponent. The previous field-relative model gave every player
- * above the field low the SAME strokes, which massively over-rewarded players
- * sitting just above the best one.
+ * Each pairing is measured on its OWN handicap gap, so a player two strokes off
+ * the best player receives nothing from them while still giving strokes to a
+ * much weaker opponent.
  *
  * @param {{name:string, handicap_index:number}[]} players
- * @returns {Object<string, Object<string, {par3:number,par4:number,par5:number}>>}
- *          matrix[receiver][giver] -> rules the receiver gets in that pairing
+ * @returns {Object<string, Object<string, number>>} matrix[receiver][giver] -> gap
  */
 export function buildStrokeMatrix(players) {
   const matrix = {};
@@ -134,16 +136,25 @@ export function buildStrokeMatrix(players) {
     matrix[a.name] = {};
     for (const b of players || []) {
       if (a.name === b.name) continue;
-      matrix[a.name][b.name] = pairStrokeRules(a.handicap_index, b.handicap_index);
+      matrix[a.name][b.name] = pairGap(a.handicap_index, b.handicap_index);
     }
   }
   return matrix;
 }
 
-/** Strokes `receiver` gets from `giver` on a hole of this par. 0 when unknown. */
-export function strokesBetween(matrix, receiver, giver, par) {
-  const rules = matrix?.[receiver]?.[giver];
-  return rules ? strokesForHole(par, rules) : 0;
+/** Stroke rules for ONE pairing, from that pair's own gap. */
+export function pairStrokeRules(hi, lo) {
+  return classifyHandicapLevel(pairGap(hi, lo)).rules;
+}
+
+/** Strokes `receiver` gets from `giver` on a hole of this par. */
+export function strokesBetween(matrix, receiver, giver, ctx = {}) {
+  const v = matrix?.[receiver]?.[giver];
+  if (v == null) return 0;
+  const par = typeof ctx === "number" ? ctx : ctx.par;
+  // new games store the gap; games persisted earlier stored a rules object
+  const rules = typeof v === "number" ? classifyHandicapLevel(v).rules : v;
+  return strokesForHole(par, rules);
 }
 
 /** True when a pairwise settlement context is usable. */
@@ -153,7 +164,7 @@ function hasPairCtx(ctx) {
 
 /** Net of `a` against `b` for this hole under pairwise strokes. */
 function pairNet(a, b, ctx) {
-  return Number(a.gross) - strokesBetween(ctx.matrix, a.name, b.name, ctx.par);
+  return Number(a.gross) - strokesBetween(ctx.matrix, a.name, b.name, ctx);
 }
 
 /**

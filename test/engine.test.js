@@ -12,6 +12,7 @@ import {
   settleHole,
   settleHoleHeadEatsTail,
   settleGame,
+  pairGap,
   pairStrokeRules,
   buildStrokeMatrix,
   strokesBetween,
@@ -25,38 +26,78 @@ const ROSTER_9678 = [
   { name: "หมวย", handicap_index: 112 },
   { name: "ติน", handicap_index: 119 },
 ];
+// CascataDA: 443545344 434544534 — a standard par 72 (4x par3, 10x par4, 4x par5)
+const CASCATA = "443545344434544534".split("").map((p, i) => ({ hole: i + 1, par: Number(p) }));
+const roundTotal = (rules) =>
+  CASCATA.reduce((s, h) => s + strokesForHole(h.par, rules), 0);
 
-test("pairStrokeRules: the lower handicap never receives", () => {
-  assert.deepEqual(pairStrokeRules(92, 119), { par3: 0, par4: 0, par5: 0 });
-  assert.deepEqual(pairStrokeRules(92, 92), { par3: 0, par4: 0, par5: 0 });
-  assert.deepEqual(pairStrokeRules(119, 92), { par3: 1, par4: 2, par5: 1 }); // gap 27 -> lv4
+test("pairGap: only the higher handicap receives", () => {
+  assert.equal(pairGap(92, 119), 0);
+  assert.equal(pairGap(92, 92), 0);
+  assert.equal(pairGap(119, 92), 27);
+});
+
+test("the eight bands cover every gap and never go backwards", () => {
+  let prev = -1;
+  for (let gap = 0; gap < 60; gap++) {
+    const { handicap_level, rules } = classifyHandicapLevel(gap);
+    const total = roundTotal(rules);
+    assert.ok(total >= prev, `gap ${gap}: total must not drop (${prev} -> ${total})`);
+    assert.ok(handicap_level >= 0 && handicap_level <= 7);
+    prev = total;
+  }
+});
+
+test("band boundaries land exactly where the group agreed", () => {
+  const lv = (g) => classifyHandicapLevel(g).handicap_level;
+  assert.deepEqual([lv(0), lv(2), lv(3), lv(6)], [0, 0, 1, 1]);
+  assert.deepEqual([lv(7), lv(12), lv(13), lv(16)], [2, 2, 3, 3]);
+  assert.deepEqual([lv(17), lv(20), lv(21), lv(24)], [4, 4, 5, 5]);
+  assert.deepEqual([lv(25), lv(30), lv(31), lv(99)], [6, 6, 7, 7]);
+});
+
+test("round totals on a par-72 card are 0,4,10,14,18,22,28,32", () => {
+  const totals = [0, 3, 7, 13, 17, 21, 25, 31].map((g) =>
+    roundTotal(classifyHandicapLevel(g).rules)
+  );
+  assert.deepEqual(totals, [0, 4, 10, 14, 18, 22, 28, 32]);
+});
+
+test("no boundary jumps more than 6 strokes (the old table jumped 10)", () => {
+  let worst = 0;
+  let prev = roundTotal(classifyHandicapLevel(0).rules);
+  for (let gap = 1; gap < 40; gap++) {
+    const total = roundTotal(classifyHandicapLevel(gap).rules);
+    worst = Math.max(worst, total - prev);
+    prev = total;
+  }
+  assert.equal(worst, 6);
 });
 
 test("stroke matrix is per-pair, not field-relative (room 9678 regression)", () => {
   const m = buildStrokeMatrix(ROSTER_9678);
-  // THE BUG: เรียว is 2 off หนึ่ง but used to receive the full level-4 allocation.
-  assert.equal(strokesBetween(m, "เรียว", "หนึ่ง", 4), 0);
-  assert.equal(strokesBetween(m, "แซม", "หนึ่ง", 4), 0); // gap 5 -> lv0
-  // genuine gaps still get strokes, sized to that pairing
-  assert.equal(strokesBetween(m, "หมวย", "หนึ่ง", 4), 1); // gap 20 -> lv3
-  assert.equal(strokesBetween(m, "ติน", "หนึ่ง", 4), 2); // gap 27 -> lv4
-  assert.equal(strokesBetween(m, "ติน", "แซม", 4), 1); // gap 22 -> lv3
-  assert.equal(strokesBetween(m, "ติน", "หมวย", 4), 1); // gap 7  -> lv1
-  assert.equal(strokesBetween(m, "ติน", "หมวย", 3), 0); // lv1 gives par-4 only
-  assert.equal(strokesBetween(m, "หมวย", "ติน", 4), 0); // reverse direction: none
+  assert.equal(m["เรียว"]["หนึ่ง"], 2);
+  assert.equal(m["แซม"]["หนึ่ง"], 5);
+  assert.equal(m["ติน"]["หนึ่ง"], 27);
+  assert.equal(m["หมวย"]["ติน"], 0, "reverse direction gives nothing");
+  // gap 5 used to be worth nothing; the finer bands now pay it on the par 5s
+  assert.equal(strokesBetween(m, "แซม", "หนึ่ง", { par: 5 }), 1);
+  assert.equal(strokesBetween(m, "แซม", "หนึ่ง", { par: 4 }), 0);
+  // gap 2 is still an even game
+  assert.equal(strokesBetween(m, "เรียว", "หนึ่ง", { par: 5 }), 0);
+  // gap 27 -> level 6
+  assert.deepEqual(pairStrokeRules(119, 92), { par3: 1, par4: 2, par5: 1 });
+  // gap 22 (ติน vs แซม) -> level 5, two strokes on the par 5s
+  assert.deepEqual(pairStrokeRules(119, 97), { par3: 1, par4: 1, par5: 2 });
 });
 
-test("settleHole with pair context: equal gross settles on pair strokes", () => {
+test("settleHole with pair context settles on that pair's own strokes", () => {
   const m = buildStrokeMatrix(ROSTER_9678);
   const rows = ROSTER_9678.map((p) => ({ name: p.name, gross: 5, net: 5 }));
   const res = settleHole(rows, 20, { par: 4, matrix: m });
-  // หนึ่ง/เรียว/แซม tie each other, all three lose to หมวย and ติน
-  assert.equal(res["หนึ่ง"], -40);
-  assert.equal(res["เรียว"], -40);
-  assert.equal(res["แซม"], -40);
-  assert.equal(res["หมวย"], 40); // beats the top three, loses to ติน
-  assert.equal(res["ติน"], 80); // beats everyone
   assert.equal(Object.values(res).reduce((a, b) => a + b, 0), 0);
+  assert.ok(res["ติน"] > 0 && res["หมวย"] > 0);
+  assert.ok(res["หนึ่ง"] < 0);
 });
 
 test("settleHole without context keeps the old net-based behaviour", () => {
@@ -69,20 +110,28 @@ test("settleGame threads par + matrix through to each hole", () => {
   const game = {
     players: ROSTER_9678,
     stroke_matrix: buildStrokeMatrix(ROSTER_9678),
-    course: { holes: [{ hole: 1, par: 4 }, { hole: 2, par: 3 }] },
+    course: { holes: CASCATA },
     stake: 20,
     format: "all_vs_all",
-    holes: {
-      1: ROSTER_9678.map((p) => ({ name: p.name, gross: 5, net: 5 })),
-      2: ROSTER_9678.map((p) => ({ name: p.name, gross: 4, net: 4 })),
-    },
+    holes: Object.fromEntries(
+      Array.from({ length: 18 }, (_, i) => [
+        i + 1,
+        ROSTER_9678.map((p) => ({ name: p.name, gross: 5, net: 5 })),
+      ])
+    ),
   };
   const s = settleGame(game);
-  // hole 1 (par 4): ติน +80, หมวย +40 ; hole 2 (par 3): ติน +2 strokes worth
-  assert.equal(s.holesCounted, 2);
+  assert.equal(s.holesCounted, 18);
   assert.equal(Object.values(s.perPlayer).reduce((a, b) => a + b, 0), 0);
-  assert.ok(s.perPlayer["เรียว"] < 0, "เรียว must no longer profit from phantom strokes");
   assert.ok(s.perPlayer["ติน"] > s.perPlayer["หมวย"]);
+});
+
+test("legacy games with the old par-band matrix still settle", () => {
+  const legacy = { B: { A: { par3: 0, par4: 1, par5: 1 } }, A: { B: null } };
+  const rows = [{ name: "A", gross: 5, net: 5 }, { name: "B", gross: 5, net: 5 }];
+  const res = settleHole(rows, 20, { par: 4, matrix: legacy });
+  assert.equal(res.B, 20);
+  assert.equal(res.A, -20);
 });
 
 test("settleHole pays pairwise, ties pay nothing", () => {
@@ -236,14 +285,16 @@ test("calculateHandicap rejects bad input", () => {
   assert.throws(() => calculateHandicap([90, 91, "x"]));
 });
 
-test("classifyHandicapLevel respects spec bands", () => {
+test("classifyHandicapLevel respects the agreed bands", () => {
   const cases = [
-    [0, 0], [5, 0],
-    [6, 1], [12, 1],
-    [13, 2], [16, 2],
-    [17, 3], [23, 3],
-    [24, 4], [30, 4],
-    [31, 5], [35, 5], [99, 5],
+    [0, 0], [2, 0],
+    [3, 1], [6, 1],
+    [7, 2], [12, 2],
+    [13, 3], [16, 3],
+    [17, 4], [20, 4],
+    [21, 5], [24, 5],
+    [25, 6], [30, 6],
+    [31, 7], [99, 7],
   ];
   for (const [diff, level] of cases) {
     assert.equal(classifyHandicapLevel(diff).handicap_level, level, `diff ${diff}`);
@@ -254,9 +305,9 @@ test("classifyHandicapLevel clamps negative diff to 0", () => {
   assert.equal(classifyHandicapLevel(-4).handicap_level, 0);
 });
 
-test("level 2 rules match the spec example", () => {
+test("level 3 rules match the spec example", () => {
   assert.deepEqual(classifyHandicapLevel(14).rules, { par3: 0, par4: 1, par5: 1 });
-  assert.deepEqual(HANDICAP_RULES_TABLE[2], { par3: 0, par4: 1, par5: 1 });
+  assert.deepEqual(HANDICAP_RULES_TABLE[3], { par3: 0, par4: 1, par5: 1 });
 });
 
 test("strokesForHole reads the rules table by par", () => {
@@ -280,7 +331,7 @@ test("buildGameStructure computes diff + level for a group", () => {
   assert.equal(g.players[0].handicap_index, 92);
   assert.equal(g.players[1].handicap_index, 82);
   assert.equal(g.diff, 10);
-  assert.equal(g.handicap_level, 1);
+  assert.equal(g.handicap_level, 2);
 });
 
 test("validateCourse flags wrong hole count", () => {

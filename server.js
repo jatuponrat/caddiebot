@@ -6,7 +6,6 @@
 import express from "express";
 import { GameStore, SESSION_TTL_MS } from "./gameStore.js";
 import { dispatch, welcomeMessage, isIdle } from "./session.js";
-import { emptyEnvelope } from "./handler.js";
 import { verifySignature, replyJson, replyText } from "./line.js";
 import { initDb, dbEnabled, dbLastError } from "./db.js";
 import { loadCoursesFromDb } from "./courseStore.js";
@@ -166,33 +165,10 @@ export async function processEvent(ev) {
     return replyJson(ev.replyToken, payload, ACCESS_TOKEN); // sends Thai summary.message
   }
 
-  // Non-text messages are only meaningful inside a live game.
-  if (!store.activeGame(sourceId)) return;
-
-  if (ev.message.type === "image") {
-    // Engine can't OCR. Hand the image off to the AI vision step:
-    //   GET https://api-data.line.me/v2/bot/message/{messageId}/content
-    // then send it to the Caddie AI vision model to fill course.holes, and POST
-    // the resulting JSON back here (course_json) to store it for the group.
-    const payload = {
-      ...emptyEnvelope(),
-      action: "image_received",
-      summary: {
-        ok: true,
-        awaiting_course_extraction: true,
-        message_id: ev.message.id,
-        source_id: sourceId,
-        message: "ได้รับรูปสกอร์การ์ดแล้ว กำลังส่งให้ AI อ่านพาร์ 18 หลุม…",
-      },
-    };
-    return replyJson(ev.replyToken, payload, ACCESS_TOKEN);
-  }
-
-  return replyText(
-    ev.replyToken,
-    "รองรับเฉพาะข้อความและรูปภาพครับ",
-    ACCESS_TOKEN
-  );
+  // Images, stickers, files, audio — the bot is text-only and stays silent.
+  // Scorecard-photo reading (AI vision) was removed: pars are typed in instead,
+  // either as a preset course name or the 18-digit par card.
+  return;
 }
 
 // Local test endpoint (no signature): POST {text, sourceId, ctx} -> JSON.

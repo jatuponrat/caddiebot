@@ -18,6 +18,7 @@ import {
   settleGame,
   scoreEmoji,
   strokesBetween,
+  classifyHandicapLevel,
 } from "./engine.js";
 import { findCustomCourse, rememberCourse } from "./courseStore.js";
 import { saveRound } from "./db.js";
@@ -41,6 +42,31 @@ function parForHole(game, hole) {
 function holeAnnounce(game, n) {
   const par = parForHole(game, n);
   return par != null ? `⛳ หลุม ${n} Par ${par} เริ่ม !!` : `⛳ หลุม ${n} เริ่ม !!`;
+}
+
+/** Point the group back at the hole the round is waiting on. Used after the
+ *  handicap table is acknowledged, so "ตกลง" leads straight back into play
+ *  instead of leaving everyone staring at a table. */
+function resumeRoundMessage(game, store) {
+  if (!game.course) {
+    return `รับทราบครับ ✅\nกรอกพาร์สนามก่อนนะครับ เช่น "454354434 443535444"`;
+  }
+  if (game.current_hole == null) {
+    if (Object.keys(game.holes || {}).length >= 18) {
+      return `รับทราบครับ ✅\n🏁 ครบ 18 หลุมแล้ว — พิมพ์ "รวม 18" หรือ "จบเกม" เพื่อสรุปเงิน`;
+    }
+    game.current_hole = 1;
+    store?.save(game);
+  }
+  const n = game.current_hole;
+  const names = (game.players || []).slice(0, 2).map((p) => p.name);
+  const eg = names.length === 2 ? `${names[0]} 5 ${names[1]} 6` : `${names[0] || "ชื่อ"} 5`;
+  return (
+    `รับทราบครับ ✅\n` +
+    `${holeAnnounce(game, n)}\n` +
+    `📝 ส่งสกอร์: "หลุม ${n} [ชื่อ] [แต้ม]"\n` +
+    `เช่น "หลุม ${n} ${eg}"`
+  );
 }
 
 /** When the roster is full, kick off hole 1 (or ask for pars first).
@@ -67,13 +93,24 @@ function maybeStartRound(game, store) {
   return "";
 }
 
-/** Strokes `receiver` gets from `giver` over the whole course, when pars are
- *  known. Returns null when the course hasn't been entered yet. */
+/** Stroke rules for a gap, for display. */
+function rulesForGap(gap) {
+  return classifyHandicapLevel(gap).rules;
+}
+
+/** The handicap gap for a pairing (0 = they play straight up). */
+function pairGapOf(game, receiver, giver) {
+  const v = game.stroke_matrix?.[receiver]?.[giver];
+  return typeof v === "number" ? v : 0;
+}
+
+/** Strokes `receiver` gets from `giver` over the whole course, when the course
+ *  is known. Returns null before the par card is entered. */
 function roundStrokes(game, receiver, giver) {
   const holes = game.course?.holes;
   if (!Array.isArray(holes) || holes.length === 0) return null;
   return holes.reduce(
-    (sum, h) => sum + strokesBetween(game.stroke_matrix, receiver, giver, h.par),
+    (sum, h) => sum + strokesBetween(game.stroke_matrix, receiver, giver, { par: h.par }),
     0
   );
 }
@@ -98,8 +135,10 @@ export function handicapTable(game) {
     for (let j = i + 1; j < byIdx.length; j++) {
       const a = byIdx[i];
       const b = byIdx[j];
-      const r = game.stroke_matrix[b.name]?.[a.name];
-      if (!r || (!r.par3 && !r.par4 && !r.par5)) {
+      // a gap inside band 0 still reads as "no strokes" — check the rules,
+      // not the raw gap, or a 2-stroke gap prints a pointless "0 แต้ม" row
+      const r = rulesForGap(pairGapOf(game, b.name, a.name));
+      if (!r.par3 && !r.par4 && !r.par5) {
         even.push(`${a.name}–${b.name} (ห่าง ${b.handicap_index - a.handicap_index})`);
       }
     }
@@ -110,10 +149,10 @@ export function handicapTable(game) {
   for (const p of [...byIdx].reverse()) {
     const rows = byIdx
       .filter((o) => o.name !== p.name)
-      .map((o) => ({ o, r: game.stroke_matrix[p.name]?.[o.name] }))
-      .filter(({ r }) => r && (r.par3 || r.par4 || r.par5))
-      .map(({ o, r }) => {
-        const gap = p.handicap_index - o.handicap_index;
+      .map((o) => ({ o, gap: pairGapOf(game, p.name, o.name) }))
+      .map(({ o, gap }) => ({ o, gap, r: rulesForGap(gap) }))
+      .filter(({ r }) => r.par3 || r.par4 || r.par5)
+      .map(({ o, gap, r }) => {
         const tot = roundStrokes(game, p.name, o.name);
         const totTxt = tot == null ? "" : ` = ${tot} แต้ม`;
         return `• จาก ${o.name} (ห่าง ${gap}) → พาร์3:${r.par3} พาร์4:${r.par4} พาร์5:${r.par5}${totTxt}`;
@@ -122,7 +161,12 @@ export function handicapTable(game) {
   }
 
   if (!game.course) lines.push("", `(ยังไม่ได้กรอกพาร์สนาม — ยอดรวมต่อรอบจะขึ้นหลังกรอก)`);
-  lines.push("", `ตกลงกันแบบนี้ไหมครับ? แก้สกอร์ได้โดยพิมพ์ "เข้าร่วม" ใหม่`);
+  lines.push(
+    "",
+    `ตกลงกันแบบนี้ไหมครับ?`,
+    `✅ ตกลง → พิมพ์ "ตกลง" แล้วเริ่มเล่นต่อได้เลย`,
+    `✏️ แก้สกอร์ → พิมพ์ "เข้าร่วม [ชื่อเดิม] [3 สกอร์ใหม่]"`
+  );
   return lines.join("\n");
 }
 
@@ -215,6 +259,21 @@ export function dispatch(text, sourceId, store) {
       return env;
     }
     // not a yes/no — fall through (pending_override stays until answered)
+  }
+
+  // "ตกลง" straight after the handicap table -> jump back to the hole in play.
+  // Skipped while a course confirmation is pending so "ยืนยัน" is never stolen.
+  if (_og?.awaiting_handicap_ack && !_og.pending_course) {
+    _og.awaiting_handicap_ack = false;
+    store.save(_og);
+    if (/^\s*(ตกลง|ตกลงครับ|ตกลงค่ะ|โอเค|โอเคครับ|okay|ok|ใช่|yes|y)\s*$/i.test(raw)) {
+      const env = emptyEnvelope();
+      env.action = "handicap_ack";
+      env.room_code = _og.room_code;
+      env.summary = { ok: true, message: resumeRoundMessage(_og, store) };
+      return env;
+    }
+    // anything else — fall through and handle it normally
   }
 
   // Cancel a game that is mid-setup.
@@ -318,8 +377,14 @@ export function dispatch(text, sourceId, store) {
     env.handicap_level = g?.handicap_level ?? null;
     env.rules = g?.rules ?? null;
     env.stroke_matrix = g?.stroke_matrix ?? null;
+    const tableOk = Boolean(g?.stroke_matrix && (g.players || []).length >= 2);
+    if (tableOk) {
+      // the next "ตกลง" means "we agree — carry on playing"
+      g.awaiting_handicap_ack = true;
+      store.save(g);
+    }
     env.summary = {
-      ok: Boolean(g?.stroke_matrix && (g.players || []).length >= 2),
+      ok: tableOk,
       message: g ? handicapTable(g) : `ยังไม่มีเกม — พิมพ์ "สร้างเกม 4 คน" ก่อนครับ`,
     };
     return env;

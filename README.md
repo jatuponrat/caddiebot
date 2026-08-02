@@ -5,7 +5,6 @@ Thai/English LINE messages, computes local handicaps, classifies the game
 handicap level, and structures hole scores into the standard backend JSON
 envelope. It **never** finalizes money settlement — that stays in your backend.
 
-The AI/vision layer (scorecard image → 18 holes + pars) sits in front of this;
 the engine here is the deterministic math and parsing.
 
 ## Run
@@ -42,7 +41,6 @@ run locally with `.env`). To deploy on Render, see **DEPLOY.th.md**.
 | `เข้าร่วม 4821 ชื่อ A 92,95,90` | `join` (+ inline `handicap_index`) |
 | `หลุม 1 A 5 B 6 C 5 D 7` | `hole_scores` (+ `net` if context given) |
 | pasted course JSON | `extract_course` (validated, 18 holes) |
-| image | `image_received` (hand off to AI vision step) |
 
 ## Group usage (add the bot to a LINE group)
 
@@ -52,7 +50,7 @@ by `groupId`, so members just chat (no need to retype the room code):
 1. Add the bot → it posts a Thai welcome with the commands.
 2. Anyone: `สร้างเกม 4 คน` → bot creates the room.
 3. Each player: `เข้าร่วม ชื่อ A 92,95,90` → handicap computed, roster updates.
-4. Send the **scorecard image** → handed to the AI vision step → pars stored.
+4. Type the par card: a preset course name, or `454354434 443535444`.
 5. Each hole: `หลุม 1 A 5 B 6 C 5 D 7` → net computed from stored handicaps.
 
 The bot replies with the friendly Thai `summary.message`; the full JSON envelope

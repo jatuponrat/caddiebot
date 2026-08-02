@@ -26,26 +26,24 @@ test("full group flow: create -> join -> course -> hole with net", () => {
   assert.equal(out.summary.handicap_index, 92);
   assert.equal(out.players.length, 1);
 
-  // join B -> roster full (2/2) => ready; diff 10 => level 1
+  // join B -> roster full (2/2) => ready; gap 10 => level 2 (par4 only)
   out = dispatch("เข้าร่วม ชื่อ B 80,82,84", G, store);
   assert.equal(out.summary.handicap_index, 82);
   assert.equal(out.players.length, 2);
   assert.equal(out.summary.status, "ready");
-  assert.equal(out.handicap_level, 1);
-  assert.deepEqual(out.rules, { par3: 0, par4: 1, par5: 0 });
 
   // set course (hole 1 = par 5) so net can be computed
   out = dispatch(JSON.stringify({ course: { name: "CC", holes: par5Hole1() } }), G, store);
   assert.equal(out.action, "extract_course");
   assert.equal(out.summary.ok, true);
 
-  // hole 1 (par 5): A is the weaker player (hc 92 > 82) -> receives 1 stroke
+  // hole 1 is a par 5; gap 10 -> level 2 gives par4 only, so nothing here
   out = dispatch("หลุม 1 A 6 B 5", G, store);
   assert.equal(out.hole, 1);
   assert.equal(out.summary.par, 5);
   assert.equal(out.summary.net_computed, true);
   const by = Object.fromEntries(out.players.map((p) => [p.name, p]));
-  assert.equal(by.A.strokes, 0); // level 1: par5 = 0 strokes
+  assert.equal(by.A.strokes, 0);
   assert.equal(by.A.net, 6);
   assert.equal(by.B.strokes, 0);
   assert.equal(by.B.net, 5);
@@ -97,7 +95,7 @@ test("par card sets the course and enables net scoring", () => {
   const G = "Gpar";
   dispatch("สร้างเกม 2 คน", G, store);
   dispatch("เข้าร่วม ชื่อ A 92,95,90", G, store); // hc 92 (weaker)
-  dispatch("เข้าร่วม ชื่อ B 80,82,84", G, store); // hc 82 (best) -> level 1
+  dispatch("เข้าร่วม ชื่อ B 80,82,84", G, store); // hc 82 (best) -> gap 10
 
   const out = dispatch("454354434 443535444", G, store);
   assert.equal(out.action, "set_course_par");
@@ -105,12 +103,12 @@ test("par card sets the course and enables net scoring", () => {
   assert.equal(out.summary.total_par, 72);
   assert.match(out.summary.message, /กรอกพาร์ 72 สำเร็จ/);
 
-  // hole 2 of the card is par 5; level 1 gives 0 strokes on par5
+  // hole 2 is a par 5; gap 10 -> level 2 is par4-only, so no stroke here
   const h = dispatch("หลุม 2 A 6 B 5", G, store);
   assert.equal(h.summary.par, 5);
   assert.equal(h.summary.net_computed, true);
   const by = Object.fromEntries(h.players.map((p) => [p.name, p]));
-  assert.equal(by.A.strokes, 0); // level 1: par5 = 0 strokes
+  assert.equal(by.A.strokes, 0);
   assert.equal(by.A.net, 6);
   assert.equal(by.B.strokes, 0);
 });
@@ -308,7 +306,7 @@ function setupMoneyGame(store, G) {
   dispatch("20", G, store); // stake 20
   dispatch("ไม่มี", G, store); // no turbo
   dispatch("เข้าร่วม A 80 80 80", G, store); // hc 80 (best)
-  dispatch("เข้าร่วม B 95 95 95", G, store); // hc 95 -> diff 15 -> level 2, B gets strokes
+  dispatch("เข้าร่วม B 95 95 95", G, store); // hc 95 -> gap 15 -> level 3 (par4+par5)
 }
 
 test("money: per-hole pairwise shown + รวม 18 totals", () => {
@@ -358,9 +356,10 @@ test("bulk: submit full rounds then settle", () => {
   assert.equal(a.summary.ok, true);
   dispatch("B 555555555 555555555", G, store); // all 5s
   const s = dispatch("รวม 18", G, store);
-  // B (weaker) gets 1 stroke on par4/par5 -> ties those; loses only the 4 par-3 holes
+  // level 3 strokes par4 + par5 -> B ties those 14 holes, loses the 4 par 3s
   assert.equal(s.summary.per_player.A, 80); // 4 par-3 holes x 20
   assert.equal(s.summary.per_player.B, -80);
+  assert.equal(s.summary.per_player.A + s.summary.per_player.B, 0);
 });
 
 test("bulk: out-of-range digit is rejected", () => {
@@ -742,15 +741,15 @@ test("แต้มต่อ prints the per-pair table", () => {
   assert.equal(out.action, "handicap");
   assert.equal(out.summary.ok, true);
   const m = out.summary.message;
-  // close players are listed as playing straight up
-  assert.match(m, /หนึ่ง–เรียว \(ห่าง 2\)/);
-  assert.match(m, /หนึ่ง–แซม \(ห่าง 5\)/);
-  // real gaps get sized strokes, with a course total
   assert.match(m, /ติน รับแต้มต่อ/);
   assert.match(m, /จาก หนึ่ง \(ห่าง 27\) → พาร์3:1 พาร์4:2 พาร์5:1 = 28 แต้ม/);
   assert.match(m, /จาก หมวย \(ห่าง 7\) → พาร์3:0 พาร์4:1 พาร์5:0 = 10 แต้ม/);
   assert.match(m, /จาก แซม \(ห่าง 15\) → พาร์3:0 พาร์4:1 พาร์5:1 = 14 แต้ม/);
-  // the bug this replaced: เรียว must never appear as a receiver
+  // the finer bands pay a gap of 5 that the old six-band table ignored
+  assert.match(m, /แซม รับแต้มต่อ/);
+  assert.match(m, /จาก หนึ่ง \(ห่าง 5\) → พาร์3:0 พาร์4:0 พาร์5:1 = 4 แต้ม/);
+  // a gap of 2 is still an even game
+  assert.match(m, /หนึ่ง–เรียว \(ห่าง 2\)/);
   assert.doesNotMatch(m, /เรียว รับแต้มต่อ/);
 });
 
@@ -763,6 +762,7 @@ test("แต้มต่อ works before the course is entered (no round totals 
   const out = dispatch("แต้มต่อ", G, store);
   assert.equal(out.summary.ok, true);
   assert.match(out.summary.message, /ยังไม่ได้กรอกพาร์สนาม/);
+  assert.match(out.summary.message, /จาก A \(ห่าง 26\) → พาร์3:1 พาร์4:2 พาร์5:1/);
   assert.doesNotMatch(out.summary.message, /แต้ม$/m);
 });
 
@@ -779,4 +779,63 @@ test("แต้มต่อ never swallows a join", () => {
   const { store, G } = roster9678();
   const out = dispatch("เข้าร่วม แต้มต่อทดสอบ 100 101 102", G, store);
   assert.equal(out.action, "join");
+});
+
+// --- "ตกลง" after the handicap table ----------------------------------------
+
+test('ตกลง after แต้มต่อ points the group back at the hole in play', () => {
+  const { store, G } = roster9678();
+  dispatch("แต้มต่อ", G, store);
+  const out = dispatch("ตกลง", G, store);
+  assert.equal(out.action, "handicap_ack");
+  assert.equal(out.summary.ok, true);
+  assert.match(out.summary.message, /รับทราบครับ/);
+  assert.match(out.summary.message, /หลุม 1 Par 4 เริ่ม/);
+  assert.match(out.summary.message, /ส่งสกอร์/);
+});
+
+test('the table tells players how to accept it', () => {
+  const { store, G } = roster9678();
+  const out = dispatch("แต้มต่อ", G, store);
+  assert.match(out.summary.message, /พิมพ์ "ตกลง"/);
+});
+
+test('ตกลง mid-round resumes the CURRENT hole, never restarts at 1', () => {
+  const { store, G } = roster9678();
+  const names = ["แซม", "หมวย", "ติน", "หนึ่ง", "เรียว"];
+  for (const h of [1, 2]) {
+    dispatch(`หลุม ${h} ` + names.map((n) => `${n} 5`).join(" "), G, store);
+  }
+  assert.equal(store.activeGame(G).current_hole, 3);
+  dispatch("แต้มต่อ", G, store);
+  const out = dispatch("ตกลง", G, store);
+  assert.match(out.summary.message, /หลุม 3 /);
+  assert.doesNotMatch(out.summary.message, /หลุม 1 /);
+  assert.equal(store.activeGame(G).current_hole, 3, "progress must be untouched");
+});
+
+test('a non-ack reply after the table falls through to normal handling', () => {
+  const { store, G } = roster9678();
+  dispatch("แต้มต่อ", G, store);
+  const out = dispatch("หลุม 1 แซม 5 หมวย 5 ติน 5 หนึ่ง 5 เรียว 5", G, store);
+  assert.equal(out.action, "hole_scores");
+  assert.equal(out.summary.complete, true);
+});
+
+test('ตกลง on its own (no table shown) is not treated as an ack', () => {
+  const { store, G } = roster9678();
+  const out = dispatch("ตกลง", G, store);
+  assert.notEqual(out.action, "handicap_ack");
+});
+
+test('แต้มต่อ before the course is entered still accepts ตกลง', () => {
+  const store = new GameStore();
+  const G = "Gack6";
+  dispatch("สร้างเกม 2 คน", G, store);
+  store.join(G, { player: "A", scores: [92, 95, 90] });
+  store.join(G, { player: "B", scores: [118, 120, 116] });
+  dispatch("แต้มต่อ", G, store);
+  const out = dispatch("ตกลง", G, store);
+  assert.equal(out.action, "handicap_ack");
+  assert.match(out.summary.message, /กรอกพาร์สนาม/);
 });

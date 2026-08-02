@@ -186,10 +186,11 @@ export class GameStore {
       handicap_level: null,
       rules: null,
       receivers: [],
-      stroke_matrix: null, // matrix[receiver][giver] -> per-pair stroke rules
+      stroke_matrix: null, // matrix[receiver][giver] -> handicap gap for that pair
       reference_player: null, // strongest player; scorecard net is shown vs them
       holes: {}, // holeNumber -> [{ name, gross, strokes?, net? }]
       current_hole: null, // the hole the round is waiting on (set when roster is full)
+      awaiting_handicap_ack: false, // true right after "แต้มต่อ" prints the table
       created_at: now,
       last_active_at: now,
       expires_at: now + SESSION_TTL_MS, // rolling: renewed on every action
@@ -393,7 +394,7 @@ export class GameStore {
   _displayStrokes(game, name, par) {
     if (par == null) return 0;
     if (game.stroke_matrix && game.reference_player) {
-      return strokesBetween(game.stroke_matrix, name, game.reference_player, par);
+      return strokesBetween(game.stroke_matrix, name, game.reference_player, { par });
     }
     // legacy games persisted before the matrix existed
     const recv = new Set(game.receivers || []);
