@@ -22,11 +22,19 @@ export function detectIntent(text) {
   if (/^\s*[\[{]/.test(raw)) return "course_json"; // pasted JSON course
   const t = normalize(raw);
   if (/(จบเกม|จบ\s*เกม|end\s*game)/i.test(t)) return "end_game";
+  // Back-nine re-handicap — must beat the plain handicap question below.
+  if (/(แต้มต่อใหม่|แต้มต่อเดิม|ใช้แต้มต่อใหม่|ใช้แต้มต่อเดิม|คิดแต้มต่อใหม่|เปลี่ยนแต้มต่อ)/i.test(t)) {
+    return "back9_handicap";
+  }
   // Must beat `settle` below: "สรุปแต้มต่อ" is a handicap question, not money.
   // Guarded against "เข้าร่วม …" so a join is never swallowed.
   if (!/(เข้าร่วม|join)/i.test(t) &&
       /(แต้มต่อ|แต้ม\s*ต่อ|ใครต่อใคร|ต่อกันเท่าไร|handicap|hdcp|\bhcp\b)/i.test(t)) {
     return "handicap";
+  }
+  // Live standings — must beat `settle`, whose pattern also matches "สรุป".
+  if (/(ยอดล่าสุด|ยอดตอนนี้|ยอดสะสม|เงินล่าสุด|ใครนำ|ใครได้ใครเสีย|standings?)/i.test(t)) {
+    return "standings";
   }
   if (/(รวม\s*18|รวมเงิน|เคลียร์เงิน|สรุปเงิน|สรุปผล|สรุป|คิดเงิน|settle)/i.test(t)) return "settle";
   if (/(สร้างเกม|สร้าง\s*เกม|create\s*game|new\s*game)/i.test(t)) return "create_game";

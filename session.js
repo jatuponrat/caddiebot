@@ -93,6 +93,68 @@ function maybeStartRound(game, store) {
   return "";
 }
 
+// Holes after which the bot posts the running total on its own.
+const TURN_HOLES = [9];
+
+/** "แซม   6 8 4 7 6 5 4 5 5 = 50 (+14)" for every player, holes 1-9. */
+export function frontNineCard(game, store) {
+  const front = store.frontNine(game);
+  const names = Object.keys(front);
+  if (!names.length) return "";
+  const pad = Math.max(...names.map((n) => n.length));
+  const parOut = (game.course?.holes || [])
+    .filter((h) => Number(h.hole) <= 9)
+    .reduce((a, h) => a + Number(h.par || 0), 0);
+  const lines = [`📋 สกอร์ OUT (หลุม 1-9${parOut ? ` · พาร์ ${parOut}` : ""})`];
+  for (const [name, v] of Object.entries(front).sort((a, b) => a[1].total - b[1].total)) {
+    const cells = v.holes.map((g) => (g == null ? "-" : String(g))).join(" ");
+    const vsPar = parOut && v.complete ? ` (${v.total - parOut >= 0 ? "+" : ""}${v.total - parOut})` : "";
+    lines.push(`${name.padEnd(pad)}  ${cells} = ${v.total}${vsPar}${v.complete ? "" : " ⚠️"}`);
+  }
+  return lines.join("\n");
+}
+
+/** What the new back-nine handicaps would be: front-nine gross x 2. */
+export function back9Preview(game, store) {
+  const front = store.frontNine(game);
+  return game.players
+    .map((p) => `${p.name} ${p.handicap_index} → ${front[p.name].total * 2}`)
+    .join(" · ");
+}
+
+/**
+ * Live money standings: who is up, who is down, and how much of the round is
+ * still to play. Ranked so the answer to "ใครนำ" is the first line, not
+ * something you have to scan an unsorted list for.
+ */
+export function standingsMessage(game, title = null) {
+  const s = settleGame(game);
+  if (!s.holesCounted) {
+    return `ยังไม่มีสกอร์ที่บันทึก — ลงแต้มหลุมแรกก่อนนะครับ`;
+  }
+  const ranked = Object.entries(s.perPlayer).sort((a, b) => b[1] - a[1]);
+  const pad = Math.max(...ranked.map(([n]) => n.length));
+  const lines = [
+    title ||
+      `💰 ยอดล่าสุด · ห้อง ${game.room_code} (เล่นไปแล้ว ${s.holesCounted}/18 หลุม)`,
+    "",
+  ];
+  ranked.forEach(([name, amt], i) => {
+    const money = amt > 0 ? `+${amt}` : amt < 0 ? `−${Math.abs(amt)}` : "0";
+    lines.push(`${i + 1}. ${name.padEnd(pad)}  ${money}`);
+  });
+
+  const played = new Set(Object.keys(game.holes || {}).map(Number));
+  const left = 18 - s.holesCounted;
+  const turboLeft = (game.turbo ? game.turbo_holes || [] : []).filter((h) => !played.has(h));
+  const tail = [];
+  if (left > 0) tail.push(`เหลืออีก ${left} หลุม`);
+  if (turboLeft.length) tail.push(`หลุมเทอร์โบที่ยังไม่เล่น: ${turboLeft.join(", ")} 🔥`);
+  if (tail.length) lines.push("", tail.join(" · "));
+  if (left === 0) lines.push("", `🏁 ครบ 18 หลุมแล้ว — พิมพ์ "จบเกม" เพื่อปิดห้อง`);
+  return lines.join("\n");
+}
+
 /** Stroke rules for a gap, for display. */
 function rulesForGap(gap) {
   return classifyHandicapLevel(gap).rules;
@@ -176,7 +238,8 @@ const WELCOME_TH =
   `กรอกพาร์สนาม: "454354434 443535444"\n` +
   `เข้าร่วม: "เข้าร่วม แซม 105 90 91"\n` +
   `ลงแต้ม: "หลุม 1 A 5 B 6" หรือ "H1 แซม 4"\n` +
-  `ดูแต้มต่อ: "แต้มต่อ" · สรุปเงิน: "รวม 18" · จบเกม: "จบเกม"`;
+  `ดูแต้มต่อ: "แต้มต่อ" · ยอดเงินล่าสุด: "ยอดล่าสุด"\n` +
+  `สรุปเงิน: "รวม 18" · จบเกม: "จบเกม"`;
 
 export function welcomeMessage() {
   return WELCOME_TH;
@@ -545,6 +608,25 @@ export function dispatch(text, sourceId, store) {
       }
       store.save(game); // current_hole is set directly here — persist it
     }
+    // Turn of the nine: post the running total unprompted. Nobody remembers to
+    // ask, and this is where a group naturally stops for a drink.
+    let turnLine = "";
+    if (TURN_HOLES.includes(hole) && netComputed && game.stake) {
+      const label = hole === 9 ? "จบ OUT (หลุม 1-9)" : `จบหลุม ${hole}`;
+      turnLine = `\n\n${standingsMessage(game, `🔄 ${label} · ยอดสะสม`)}`;
+      const card = frontNineCard(game, store);
+      if (card) turnLine += `\n\n${card}`;
+      // Offer fresh handicaps for the back nine while everyone is looking at
+      // the front-nine numbers — this is the only moment the offer makes sense.
+      if (!game.back9_handicap && game.players.length >= 2) {
+        game.awaiting_back9_handicap = true;
+        store.save(game);
+        turnLine +=
+          `\n\n🔁 9 หลุมหลังจะใช้แต้มต่อใหม่ไหมครับ?` +
+          `\n(คิดจากสกอร์ 9 หลุมแรก ×2 — ${back9Preview(game, store)})` +
+          `\nพิมพ์ "แต้มต่อใหม่" เพื่อเปลี่ยน · "แต้มต่อเดิม" เพื่อใช้ของเดิม`;
+      }
+    }
     env.summary = {
       ok: true,
       hole,
@@ -554,7 +636,10 @@ export function dispatch(text, sourceId, store) {
       turbo,
       stake: game.stake,
       money: holeMoney,
-      message: `หลุม ${hole} ครบทุกคน ✅${turboTag}${moneyLine}${nextLine}`,
+      turn_summary: Boolean(turnLine),
+      message:
+        `หลุม ${hole} ครบทุกคน ✅${turboTag}${moneyLine}${turnLine}` +
+        (turnLine ? `\n${nextLine}` : nextLine),
     };
     return env;
   }
@@ -577,6 +662,76 @@ export function dispatch(text, sourceId, store) {
       message: r.ok
         ? `บันทึกสนามแล้ว (พาร์รวม ${r.game.course.total_par})` + maybeStartRound(r.game, store)
         : "ข้อมูลสนามไม่ครบ 18 หลุม หรือค่าพาร์ผิด",
+    };
+    return env;
+  }
+
+  if (intent === "back9_handicap") {
+    const env = emptyEnvelope();
+    env.action = "back9_handicap";
+    const g = store.activeGame(sourceId);
+    env.room_code = g?.room_code || null;
+    if (g) {
+      g.awaiting_back9_handicap = false;
+      store.save(g);
+    }
+    if (/(เดิม|ไม่|no)/i.test(raw)) {
+      env.summary = {
+        ok: true,
+        changed: false,
+        message: `รับทราบครับ ✅ 9 หลุมหลังใช้แต้มต่อเดิม`,
+      };
+      return env;
+    }
+    const r = store.applyBack9Handicap(sourceId);
+    if (!r.ok) {
+      env.summary = {
+        ok: false,
+        changed: false,
+        message:
+          r.error === "already_applied"
+            ? `เปลี่ยนแต้มต่อสำหรับ 9 หลุมหลังไปแล้วครับ`
+            : r.error === "front_nine_incomplete"
+              ? `ยังลงสกอร์ 9 หลุมแรกไม่ครบ (ขาด: ${(r.missing || []).join(", ")}) — ลงให้ครบก่อนนะครับ`
+              : `ไม่มีเกมที่กำลังเล่นอยู่`,
+      };
+      return env;
+    }
+    const rows = r.game.players.map(
+      (p) => `${p.name}: ${r.before[p.name]} → ${p.handicap_index}`
+    );
+    env.players = r.game.players;
+    env.summary = {
+      ok: true,
+      changed: true,
+      before: r.before,
+      after: r.after,
+      message:
+        `🔁 แต้มต่อใหม่สำหรับ 9 หลุมหลัง ✅\n` +
+        rows.join("\n") +
+        `\n\nหลุม 1-9 คิดเงินด้วยแต้มต่อเดิม ไม่เปลี่ยนย้อนหลัง\n` +
+        `พิมพ์ "แต้มต่อ" เพื่อดูตารางใหม่`,
+    };
+    return env;
+  }
+
+  if (intent === "standings") {
+    const env = emptyEnvelope();
+    env.action = "standings";
+    const g = store.activeGame(sourceId);
+    if (!g) {
+      env.summary = { ok: false, message: `ไม่มีเกมที่กำลังเล่นอยู่ — พิมพ์ "สร้างเกม" ก่อน` };
+      return env;
+    }
+    store.save(g); // asking for the money is real activity — renew the 12h window
+    const s = settleGame(g);
+    env.players = g.players;
+    env.summary = {
+      ok: s.holesCounted > 0,
+      holes_counted: s.holesCounted,
+      holes_left: 18 - s.holesCounted,
+      per_player: s.perPlayer,
+      message: standingsMessage(g),
     };
     return env;
   }

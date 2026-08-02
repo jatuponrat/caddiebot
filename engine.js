@@ -147,6 +147,18 @@ export function pairStrokeRules(hi, lo) {
   return classifyHandicapLevel(pairGap(hi, lo)).rules;
 }
 
+/**
+ * The stroke matrix in force on a given hole.
+ *
+ * A group may re-handicap for the back nine (see gameStore.applyBack9Handicap).
+ * When they do, holes 1-9 must keep settling on the ORIGINAL matrix — otherwise
+ * re-handicapping would silently rewrite money that was already agreed.
+ */
+export function matrixForHole(game, hole) {
+  if (game?.front_matrix && Number(hole) <= 9) return game.front_matrix;
+  return game?.stroke_matrix || null;
+}
+
 /** Strokes `receiver` gets from `giver` on a hole of this par. */
 export function strokesBetween(matrix, receiver, giver, ctx = {}) {
   const v = matrix?.[receiver]?.[giver];
@@ -353,12 +365,12 @@ export function settleGame(game) {
     .map(Number)
     .sort((a, b) => a - b);
   const settleFn = game.format === "head_tail" ? settleHoleHeadEatsTail : settleHole;
-  const matrix = game.stroke_matrix || null;
   for (const hole of nums) {
     const mult = game.turbo && (game.turbo_holes || []).includes(hole) ? 2 : 1;
     const stake = (game.stake || 0) * mult;
     const par =
       game.course?.holes?.find((h) => Number(h.hole) === Number(hole))?.par ?? null;
+    const matrix = matrixForHole(game, hole);
     const results = settleFn(game.holes[hole], stake, matrix ? { par, matrix } : null);
     for (const name in results) if (name in totals) totals[name] += results[name];
     perHole.push({ hole, turbo: mult > 1, stake, results });

@@ -839,3 +839,229 @@ test('แต้มต่อ before the course is entered still accepts ตกล
   assert.equal(out.action, "handicap_ack");
   assert.match(out.summary.message, /กรอกพาร์สนาม/);
 });
+
+// --- ยอดล่าสุด (live standings) ----------------------------------------------
+
+/** Play `n` holes of the room-9678 roster, everyone on the same gross. */
+function playHoles(store, G, n, gross = { แซม: 5, หมวย: 6, ติน: 6, หนึ่ง: 5, เรียว: 5 }) {
+  for (let h = 1; h <= n; h++) {
+    dispatch(
+      `หลุม ${h} ` + Object.entries(gross).map(([n2, g]) => `${n2} ${g}`).join(" "),
+      G,
+      store
+    );
+  }
+}
+
+test("ยอดล่าสุด ranks players and shows how much round is left", () => {
+  const { store, G } = roster9678();
+  playHoles(store, G, 7);
+  const out = dispatch("ยอดล่าสุด", G, store);
+  assert.equal(out.action, "standings");
+  assert.equal(out.summary.ok, true);
+  assert.equal(out.summary.holes_counted, 7);
+  assert.equal(out.summary.holes_left, 11);
+  const m = out.summary.message;
+  assert.match(m, /เล่นไปแล้ว 7\/18 หลุม/);
+  assert.match(m, /เหลืออีก 11 หลุม/);
+  assert.match(m, /^1\. /m);
+  assert.match(m, /^5\. /m);
+  // the leader must be listed first
+  const leader = Object.entries(out.summary.per_player).sort((a, b) => b[1] - a[1])[0][0];
+  assert.match(m.split("\n")[2], new RegExp(`^1\\. ${leader}`));
+  assert.equal(Object.values(out.summary.per_player).reduce((a, b) => a + b, 0), 0);
+});
+
+test("ยอดล่าสุด flags turbo holes that have not been played yet", () => {
+  const { store, G } = roster9678();
+  const g = store.activeGame(G);
+  g.turbo = true;
+  g.turbo_holes = [9, 18];
+  store.save(g);
+  playHoles(store, G, 7);
+  assert.match(dispatch("ยอดล่าสุด", G, store).summary.message, /ยังไม่เล่น: 9, 18/);
+  playHoles(store, G, 10); // now holes 1-10, so turbo 9 is done
+  const m = dispatch("ยอดล่าสุด", G, store).summary.message;
+  assert.match(m, /ยังไม่เล่น: 18/);
+  assert.doesNotMatch(m, /ยังไม่เล่น: 9/);
+});
+
+test("ยอดล่าสุด after 18 holes points at จบเกม instead of holes left", () => {
+  const { store, G } = roster9678();
+  playHoles(store, G, 18);
+  const out = dispatch("ยอดล่าสุด", G, store);
+  assert.equal(out.summary.holes_left, 0);
+  assert.match(out.summary.message, /ครบ 18 หลุมแล้ว/);
+  assert.doesNotMatch(out.summary.message, /เหลืออีก/);
+});
+
+test("ยอดล่าสุด before any score says so instead of printing an empty table", () => {
+  const { store, G } = roster9678();
+  const out = dispatch("ยอดล่าสุด", G, store);
+  assert.equal(out.summary.ok, false);
+  assert.equal(out.summary.holes_counted, 0);
+  assert.match(out.summary.message, /ยังไม่มีสกอร์/);
+});
+
+test("ยอดล่าสุด does not steal the settle or end-game commands", () => {
+  const { store, G } = roster9678();
+  playHoles(store, G, 3);
+  assert.equal(dispatch("รวม 18", G, store).action, "settle");
+  assert.equal(dispatch("สรุปเงิน", G, store).action, "settle");
+  assert.equal(dispatch("ยอดตอนนี้", G, store).action, "standings");
+  assert.equal(dispatch("ใครนำ", G, store).action, "standings");
+});
+
+// --- automatic turn summary at hole 9 ----------------------------------------
+
+test("finishing hole 9 posts the running total without being asked", () => {
+  const { store, G } = roster9678();
+  let out;
+  for (let h = 1; h <= 9; h++) {
+    out = dispatch(
+      `หลุม ${h} แซม 5 หมวย 6 ติน 6 หนึ่ง 5 เรียว 5`,
+      G,
+      store
+    );
+  }
+  assert.equal(out.summary.turn_summary, true);
+  const m = out.summary.message;
+  assert.match(m, /หลุม 9 ครบทุกคน/);
+  assert.match(m, /จบ OUT \(หลุม 1-9\) · ยอดสะสม/);
+  assert.match(m, /เหลืออีก 9 หลุม/);
+  assert.match(m, /^1\. /m);
+  assert.match(m, /หลุม 10 Par .* เริ่ม/); // still announces the next hole
+});
+
+test("no turn summary on any hole other than 9", () => {
+  const { store, G } = roster9678();
+  for (let h = 1; h <= 12; h++) {
+    const out = dispatch(`หลุม ${h} แซม 5 หมวย 6 ติน 6 หนึ่ง 5 เรียว 5`, G, store);
+    if (h === 9) continue;
+    assert.notEqual(out.summary.turn_summary, true, `hole ${h} must stay quiet`);
+    assert.doesNotMatch(out.summary.message, /ยอดสะสม/);
+  }
+});
+
+test("hole 9 completed out of order still triggers the summary", () => {
+  const { store, G } = roster9678();
+  for (const h of [1, 3, 5, 7, 9]) {
+    const out = dispatch(`หลุม ${h} แซม 5 หมวย 6 ติน 6 หนึ่ง 5 เรียว 5`, G, store);
+    if (h === 9) assert.equal(out.summary.turn_summary, true);
+  }
+});
+
+test("turn summary is skipped when there is no stake to total", () => {
+  const store = new GameStore();
+  const G = "Gnostake";
+  dispatch("สร้างเกม 2 คน", G, store);
+  store.join(G, { player: "A", scores: [92, 95, 90] });
+  store.join(G, { player: "B", scores: [80, 82, 84] });
+  dispatch("454354434 443535444", G, store);
+  let out;
+  for (let h = 1; h <= 9; h++) out = dispatch(`หลุม ${h} A 5 B 5`, G, store);
+  assert.notEqual(out.summary.turn_summary, true);
+  assert.doesNotMatch(out.summary.message, /ยอดสะสม/);
+});
+
+// --- OUT scorecard + back-nine re-handicap -----------------------------------
+
+/** Play holes 1..9 with distinct scores so the OUT totals differ per player. */
+function playFrontNine(store, G) {
+  const gross = { แซม: 5, หมวย: 7, ติน: 6, หนึ่ง: 4, เรียว: 5 };
+  for (let h = 1; h <= 9; h++) {
+    dispatch(
+      `หลุม ${h} ` + Object.entries(gross).map(([n, g]) => `${n} ${g}`).join(" "),
+      G,
+      store
+    );
+  }
+  return gross;
+}
+
+test("hole 9 also prints every player's OUT scorecard", () => {
+  const { store, G } = roster9678();
+  playFrontNine(store, G);
+  const out = dispatch("ยอดล่าสุด", G, store); // standings alone has no card
+  assert.doesNotMatch(out.summary.message, /สกอร์ OUT/);
+  const { store: s2, G: G2 } = roster9678();
+  let last;
+  for (let h = 1; h <= 9; h++) {
+    last = dispatch(`หลุม ${h} แซม 5 หมวย 7 ติน 6 หนึ่ง 4 เรียว 5`, G2, s2);
+  }
+  const m = last.summary.message;
+  assert.match(m, /📋 สกอร์ OUT \(หลุม 1-9 · พาร์ 36\)/);
+  assert.match(m, /หนึ่ง\s+4 4 4 4 4 4 4 4 4 = 36 \(\+0\)/);
+  assert.match(m, /หมวย\s+7 7 7 7 7 7 7 7 7 = 63 \(\+27\)/);
+  // best OUT is listed first
+  assert.ok(m.search(/หนึ่ง\s+4 4/) < m.search(/หมวย\s+7 7/));
+});
+
+test("hole 9 offers fresh back-nine handicaps with a preview", () => {
+  const { store, G } = roster9678();
+  let last;
+  for (let h = 1; h <= 9; h++) {
+    last = dispatch(`หลุม ${h} แซม 5 หมวย 7 ติน 6 หนึ่ง 4 เรียว 5`, G, store);
+  }
+  assert.match(last.summary.message, /9 หลุมหลังจะใช้แต้มต่อใหม่ไหมครับ/);
+  assert.match(last.summary.message, /หนึ่ง 92 → 72/); // OUT 36 x 2
+  assert.match(last.summary.message, /หมวย 112 → 126/); // OUT 63 x 2
+});
+
+test('"แต้มต่อใหม่" re-handicaps off OUT x 2 and never rewrites holes 1-9', () => {
+  const { store, G } = roster9678();
+  for (let h = 1; h <= 9; h++) {
+    dispatch(`หลุม ${h} แซม 5 หมวย 7 ติน 6 หนึ่ง 4 เรียว 5`, G, store);
+  }
+  const before = dispatch("ยอดล่าสุด", G, store).summary.per_player;
+  const out = dispatch("แต้มต่อใหม่", G, store);
+  assert.equal(out.action, "back9_handicap");
+  assert.equal(out.summary.changed, true);
+  assert.equal(out.summary.after["หนึ่ง"], 72);
+  assert.equal(out.summary.after["หมวย"], 126);
+  assert.equal(store.activeGame(G).back9_handicap, true);
+  // money already banked on the front nine must be untouched
+  const after = dispatch("ยอดล่าสุด", G, store).summary.per_player;
+  assert.deepEqual(after, before);
+});
+
+test('"แต้มต่อเดิม" keeps the original handicaps', () => {
+  const { store, G } = roster9678();
+  for (let h = 1; h <= 9; h++) {
+    dispatch(`หลุม ${h} แซม 5 หมวย 7 ติน 6 หนึ่ง 4 เรียว 5`, G, store);
+  }
+  const out = dispatch("แต้มต่อเดิม", G, store);
+  assert.equal(out.summary.changed, false);
+  assert.match(out.summary.message, /ใช้แต้มต่อเดิม/);
+  const g = store.activeGame(G);
+  assert.equal(g.back9_handicap, false);
+  assert.equal(g.players.find((p) => p.name === "หนึ่ง").handicap_index, 92);
+});
+
+test("re-handicapping is refused before the front nine is complete", () => {
+  const { store, G } = roster9678();
+  for (let h = 1; h <= 5; h++) {
+    dispatch(`หลุม ${h} แซม 5 หมวย 7 ติน 6 หนึ่ง 4 เรียว 5`, G, store);
+  }
+  const out = dispatch("แต้มต่อใหม่", G, store);
+  assert.equal(out.summary.ok, false);
+  assert.match(out.summary.message, /ยังลงสกอร์ 9 หลุมแรกไม่ครบ/);
+});
+
+test("re-handicapping twice is refused", () => {
+  const { store, G } = roster9678();
+  for (let h = 1; h <= 9; h++) {
+    dispatch(`หลุม ${h} แซม 5 หมวย 7 ติน 6 หนึ่ง 4 เรียว 5`, G, store);
+  }
+  dispatch("แต้มต่อใหม่", G, store);
+  const again = dispatch("แต้มต่อใหม่", G, store);
+  assert.equal(again.summary.ok, false);
+  assert.match(again.summary.message, /ไปแล้ว/);
+});
+
+test("แต้มต่อใหม่ does not get swallowed by the plain แต้มต่อ table", () => {
+  const { store, G } = roster9678();
+  assert.equal(dispatch("แต้มต่อ", G, store).action, "handicap");
+  assert.equal(dispatch("แต้มต่อใหม่", G, store).action, "back9_handicap");
+  assert.equal(dispatch("แต้มต่อเดิม", G, store).action, "back9_handicap");
+});

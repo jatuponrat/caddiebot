@@ -9,6 +9,7 @@ import {
   classifyHandicapLevel,
   strokesForHole,
   buildStrokeMatrix,
+  matrixForHole,
   strokesBetween,
   computeNet,
   validateCourse,
@@ -187,6 +188,9 @@ export class GameStore {
       rules: null,
       receivers: [],
       stroke_matrix: null, // matrix[receiver][giver] -> handicap gap for that pair
+      front_matrix: null, // frozen copy used by holes 1-9 after a back-9 re-handicap
+      front_reference_player: null,
+      back9_handicap: false, // true once the back nine runs on fresh handicaps
       reference_player: null, // strongest player; scorecard net is shown vs them
       holes: {}, // holeNumber -> [{ name, gross, strokes?, net? }]
       current_hole: null, // the hole the round is waiting on (set when roster is full)
@@ -391,14 +395,75 @@ export class GameStore {
    *  course par + handicap rules. Called after rules or course change mid-game. */
   /** Display strokes for one player on one hole: what they receive from the
    *  group's strongest player. Settlement uses the full matrix, not this. */
-  _displayStrokes(game, name, par) {
+  _displayStrokes(game, name, par, hole = null) {
     if (par == null) return 0;
-    if (game.stroke_matrix && game.reference_player) {
-      return strokesBetween(game.stroke_matrix, name, game.reference_player, { par });
+    const matrix = hole == null ? game.stroke_matrix : matrixForHole(game, hole);
+    const ref =
+      hole != null && game.front_matrix && Number(hole) <= 9
+        ? game.front_reference_player || game.reference_player
+        : game.reference_player;
+    if (matrix && ref) {
+      return strokesBetween(matrix, name, ref, { par });
     }
     // legacy games persisted before the matrix existed
     const recv = new Set(game.receivers || []);
     return recv.has(name) ? strokesForHole(par, game.rules) : 0;
+  }
+
+  /** Gross totals for holes 1-9: { name -> {holes:[], total, complete} }. */
+  frontNine(game) {
+    const out = {};
+    for (const p of game.players || []) {
+      const holes = [];
+      let total = 0;
+      let complete = true;
+      for (let h = 1; h <= 9; h++) {
+        const row = (game.holes?.[h] || []).find((r) => r.name === p.name);
+        const g = row && !row.give_up ? row.gross : null;
+        holes.push(g);
+        if (g == null) complete = false;
+        else total += g;
+      }
+      out[p.name] = { holes, total, complete };
+    }
+    return out;
+  }
+
+  /**
+   * Re-handicap for the back nine off the front-nine scores (OUT x 2).
+   *
+   * The front-nine matrix is frozen first, so holes 1-9 keep settling exactly as
+   * they already did — re-handicapping must never rewrite money the group has
+   * already seen. Only holes 10-18 use the new numbers.
+   */
+  applyBack9Handicap(sourceId) {
+    const game = this._resolve(null, sourceId);
+    if (!game) return { ok: false, error: "room_not_found" };
+    if (game.back9_handicap) return { ok: false, error: "already_applied", game };
+    const front = this.frontNine(game);
+    const missing = Object.entries(front)
+      .filter(([, v]) => !v.complete)
+      .map(([n]) => n);
+    if (missing.length) return { ok: false, error: "front_nine_incomplete", missing, game };
+
+    // freeze what holes 1-9 were played under
+    game.front_matrix = game.stroke_matrix;
+    game.front_reference_player = game.reference_player;
+
+    const before = {};
+    for (const p of game.players) {
+      before[p.name] = p.handicap_index;
+      p.handicap_index = front[p.name].total * 2;
+    }
+    game.back9_handicap = true;
+    this._recompute(game); // rebuilds stroke_matrix from the new indices
+    this._persist(game);
+    return {
+      ok: true,
+      game,
+      before,
+      after: Object.fromEntries(game.players.map((p) => [p.name, p.handicap_index])),
+    };
   }
 
   _recomputeNets(game) {
@@ -408,7 +473,7 @@ export class GameStore {
       if (par == null) continue;
       for (const row of rows) {
         if (row.give_up || row.gross == null) continue;
-        const strokes = this._displayStrokes(game, row.name, par);
+        const strokes = this._displayStrokes(game, row.name, par, Number(holeNum));
         row.strokes = strokes;
         row.net = computeNet(row.gross, strokes);
       }
@@ -437,7 +502,7 @@ export class GameStore {
       } else {
         row.gross = p.gross;
         if (canNet) {
-          const strokes = this._displayStrokes(game, p.name, par);
+          const strokes = this._displayStrokes(game, p.name, par, Number(hole));
           row.strokes = strokes;
           row.net = computeNet(p.gross, strokes);
         }
@@ -468,7 +533,7 @@ export class GameStore {
         : null;
       const row = { name, gross };
       if (rules && par != null) {
-        const strokes = this._displayStrokes(game, name, par);
+        const strokes = this._displayStrokes(game, name, par, hole);
         row.strokes = strokes;
         row.net = computeNet(gross, strokes);
       }
