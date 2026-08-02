@@ -15,13 +15,19 @@ export function normalize(text) {
 
 /**
  * Decide what kind of message this is.
- * @returns {'course_json'|'create_game'|'join'|'hole_scores'|'par_string'|'bulk_scores'|'settle'|'end_game'|'unknown'}
+ * @returns {'course_json'|'create_game'|'join'|'hole_scores'|'par_string'|'bulk_scores'|'settle'|'end_game'|'handicap'|'unknown'}
  */
 export function detectIntent(text) {
   const raw = String(text ?? "");
   if (/^\s*[\[{]/.test(raw)) return "course_json"; // pasted JSON course
   const t = normalize(raw);
   if (/(จบเกม|จบ\s*เกม|end\s*game)/i.test(t)) return "end_game";
+  // Must beat `settle` below: "สรุปแต้มต่อ" is a handicap question, not money.
+  // Guarded against "เข้าร่วม …" so a join is never swallowed.
+  if (!/(เข้าร่วม|join)/i.test(t) &&
+      /(แต้มต่อ|แต้ม\s*ต่อ|ใครต่อใคร|ต่อกันเท่าไร|handicap|hdcp|\bhcp\b)/i.test(t)) {
+    return "handicap";
+  }
   if (/(รวม\s*18|รวมเงิน|เคลียร์เงิน|สรุปเงิน|สรุปผล|สรุป|คิดเงิน|settle)/i.test(t)) return "settle";
   if (/(สร้างเกม|สร้าง\s*เกม|create\s*game|new\s*game)/i.test(t)) return "create_game";
   if (/(เข้าร่วม|join)/i.test(t)) return "join";
@@ -77,10 +83,12 @@ export function parseHoleScores(text) {
   const rest = holeMatch ? t.replace(holeMatch[0], " ") : t;
 
   const players = [];
-  const re = /([A-Za-z฀-๿][A-Za-z0-9฀-๿]*)\s*[:：]?\s*(\d{1,2})\b/g;
+  // value is a 1-2 digit score OR "g"/"G" = give up (แพ้หลุมนั้น)
+  const re = /([A-Za-z฀-๿][A-Za-z0-9฀-๿]*)\s*[:：]?\s*(\d{1,2}|[gG])\b/g;
   let m;
   while ((m = re.exec(rest)) !== null) {
-    players.push({ name: m[1], gross: Number(m[2]) });
+    if (/^[gG]$/.test(m[2])) players.push({ name: m[1], gross: null, give_up: true });
+    else players.push({ name: m[1], gross: Number(m[2]) });
   }
   return { action: "hole_scores", hole, players };
 }

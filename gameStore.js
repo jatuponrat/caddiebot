@@ -8,6 +8,8 @@ import {
   calculateHandicap,
   classifyHandicapLevel,
   strokesForHole,
+  buildStrokeMatrix,
+  strokesBetween,
   computeNet,
   validateCourse,
 } from "./engine.js";
@@ -184,6 +186,8 @@ export class GameStore {
       handicap_level: null,
       rules: null,
       receivers: [],
+      stroke_matrix: null, // matrix[receiver][giver] -> per-pair stroke rules
+      reference_player: null, // strongest player; scorecard net is shown vs them
       holes: {}, // holeNumber -> [{ name, gross, strokes?, net? }]
       current_hole: null, // the hole the round is waiting on (set when roster is full)
       created_at: now,
@@ -360,8 +364,14 @@ export class GameStore {
     const { handicap_level, rules } = classifyHandicapLevel(game.diff);
     game.handicap_level = handicap_level;
     game.rules = rules;
-    // DEMO stroke allocation: the lowest-handicap player gives; everyone else
-    // receives strokes per the rules table. Adjust to your real game logic.
+    // Stroke allocation is PER PAIR: every pairing is classified on its own
+    // handicap gap (see engine.buildStrokeMatrix). This is what settlement uses.
+    game.stroke_matrix = buildStrokeMatrix(game.players);
+    // Scorecard net is shown against the strongest player in the group — one
+    // row of the matrix, so the number on screen agrees with how money is run.
+    game.reference_player = game.players.find((p) => p.handicap_index === best)?.name ?? null;
+    // `receivers` + `rules` remain FIELD-RELATIVE and are display-only: they
+    // drive the net shown on the scorecard. Money never reads them.
     game.receivers = game.players
       .filter((p) => p.handicap_index > best)
       .map((p) => p.name);
@@ -378,15 +388,26 @@ export class GameStore {
 
   /** Recompute strokes/net for every already-recorded hole row using the current
    *  course par + handicap rules. Called after rules or course change mid-game. */
+  /** Display strokes for one player on one hole: what they receive from the
+   *  group's strongest player. Settlement uses the full matrix, not this. */
+  _displayStrokes(game, name, par) {
+    if (par == null) return 0;
+    if (game.stroke_matrix && game.reference_player) {
+      return strokesBetween(game.stroke_matrix, name, game.reference_player, par);
+    }
+    // legacy games persisted before the matrix existed
+    const recv = new Set(game.receivers || []);
+    return recv.has(name) ? strokesForHole(par, game.rules) : 0;
+  }
+
   _recomputeNets(game) {
     if (!game.course || !game.rules) return;
-    const recv = new Set(game.receivers || []);
     for (const [holeNum, rows] of Object.entries(game.holes)) {
       const par = game.course.holes.find((h) => Number(h.hole) === Number(holeNum))?.par ?? null;
       if (par == null) continue;
       for (const row of rows) {
         if (row.give_up || row.gross == null) continue;
-        const strokes = recv.has(row.name) ? strokesForHole(par, game.rules) : 0;
+        const strokes = this._displayStrokes(game, row.name, par);
         row.strokes = strokes;
         row.net = computeNet(row.gross, strokes);
       }
@@ -404,7 +425,6 @@ export class GameStore {
       ? game.course.holes.find((h) => Number(h.hole) === Number(hole))?.par ?? null
       : null;
     const rules = game.rules;
-    const recv = new Set(game.receivers || []);
     const canNet = Boolean(rules && par != null);
     const arr = game.holes[hole] || (game.holes[hole] = []);
 
@@ -416,7 +436,7 @@ export class GameStore {
       } else {
         row.gross = p.gross;
         if (canNet) {
-          const strokes = recv.has(p.name) ? strokesForHole(par, rules) : 0;
+          const strokes = this._displayStrokes(game, p.name, par);
           row.strokes = strokes;
           row.net = computeNet(p.gross, strokes);
         }
@@ -439,7 +459,6 @@ export class GameStore {
       return { ok: false, error: "need_18", game };
     }
     const rules = game.rules;
-    const recv = new Set(game.receivers || []);
     for (let i = 0; i < 18; i++) {
       const hole = i + 1;
       const gross = scores[i];
@@ -448,7 +467,7 @@ export class GameStore {
         : null;
       const row = { name, gross };
       if (rules && par != null) {
-        const strokes = recv.has(name) ? strokesForHole(par, rules) : 0;
+        const strokes = this._displayStrokes(game, name, par);
         row.strokes = strokes;
         row.net = computeNet(gross, strokes);
       }

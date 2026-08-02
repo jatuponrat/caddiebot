@@ -102,6 +102,74 @@ export function strokesForHole(par, rules) {
   return Number(rules[key]) || 0;
 }
 
+const NO_STROKES = { par3: 0, par4: 0, par5: 0 };
+
+/**
+ * Stroke rules for ONE pairing, derived from the two players' own gap.
+ * The higher handicap_index receives; the lower gives nothing.
+ * @returns {{par3:number,par4:number,par5:number}} rules for `hi` vs `lo`
+ */
+export function pairStrokeRules(hi, lo) {
+  const d = Math.round(Number(hi) - Number(lo));
+  if (!Number.isFinite(d) || d <= 0) return { ...NO_STROKES };
+  return classifyHandicapLevel(d).rules;
+}
+
+/**
+ * Per-PAIR stroke allocation (not field-relative).
+ *
+ * Each pairing is classified on its OWN handicap gap, so a player two strokes
+ * off the best player receives nothing from them while still giving strokes to
+ * a much weaker opponent. The previous field-relative model gave every player
+ * above the field low the SAME strokes, which massively over-rewarded players
+ * sitting just above the best one.
+ *
+ * @param {{name:string, handicap_index:number}[]} players
+ * @returns {Object<string, Object<string, {par3:number,par4:number,par5:number}>>}
+ *          matrix[receiver][giver] -> rules the receiver gets in that pairing
+ */
+export function buildStrokeMatrix(players) {
+  const matrix = {};
+  for (const a of players || []) {
+    matrix[a.name] = {};
+    for (const b of players || []) {
+      if (a.name === b.name) continue;
+      matrix[a.name][b.name] = pairStrokeRules(a.handicap_index, b.handicap_index);
+    }
+  }
+  return matrix;
+}
+
+/** Strokes `receiver` gets from `giver` on a hole of this par. 0 when unknown. */
+export function strokesBetween(matrix, receiver, giver, par) {
+  const rules = matrix?.[receiver]?.[giver];
+  return rules ? strokesForHole(par, rules) : 0;
+}
+
+/** True when a pairwise settlement context is usable. */
+function hasPairCtx(ctx) {
+  return Boolean(ctx && ctx.matrix && ctx.par != null);
+}
+
+/** Net of `a` against `b` for this hole under pairwise strokes. */
+function pairNet(a, b, ctx) {
+  return Number(a.gross) - strokesBetween(ctx.matrix, a.name, b.name, ctx.par);
+}
+
+/**
+ * Compare two rows for one hole. Returns -1 when `a` wins, 1 when `b` wins,
+ * 0 when tied. Uses pairwise strokes when ctx allows, else the precomputed
+ * field-relative `net` (backward compatible).
+ */
+function comparePair(a, b, ctx) {
+  if (hasPairCtx(ctx) && a.gross != null && b.gross != null) {
+    const an = pairNet(a, b, ctx);
+    const bn = pairNet(b, a, ctx);
+    return an < bn ? -1 : bn < an ? 1 : 0;
+  }
+  return a.net < b.net ? -1 : b.net < a.net ? 1 : 0;
+}
+
 /**
  * NET = GROSS - strokes received (spec rule #6: only when handicap context given).
  * Never returns below 0 strokes; net itself may be any integer.
@@ -157,9 +225,9 @@ export function validateCourse(course) {
  * @param {number} stake - money per pairwise win on this hole (turbo already applied)
  * @returns {Object<string, number>} name -> amount won(+)/lost(-) this hole
  */
-export function settleHole(rows, stake) {
+export function settleHole(rows, stake, ctx = null) {
   const res = {};
-  const valid = (rows || []).filter((r) => r && (r.give_up || r.net != null));
+  const valid = (rows || []).filter((r) => r && (r.give_up || r.net != null || r.gross != null));
   valid.forEach((r) => (res[r.name] = 0));
   for (let i = 0; i < valid.length; i++) {
     for (let j = i + 1; j < valid.length; j++) {
@@ -177,13 +245,14 @@ export function settleHole(rows, stake) {
         res[a.name] += stake;
         continue;
       }
-      if (a.net < b.net) {
+      const cmp = comparePair(a, b, ctx);
+      if (cmp < 0) {
         res[a.name] += stake;
         res[b.name] -= stake;
-      } else if (b.net < a.net) {
+      } else if (cmp > 0) {
         res[b.name] += stake;
         res[a.name] -= stake;
-      } // equal net -> no payment (split)
+      } // tie -> no payment (split)
     }
   }
   return res;
@@ -201,9 +270,9 @@ export function settleHole(rows, stake) {
  * @param {number} stake - money per pair win (turbo already applied)
  * @returns {Object<string, number>} name -> amount won(+)/lost(-) this hole
  */
-export function settleHoleHeadEatsTail(rows, stake) {
+export function settleHoleHeadEatsTail(rows, stake, ctx = null) {
   const res = {};
-  const valid = (rows || []).filter((r) => r && (r.give_up || r.net != null));
+  const valid = (rows || []).filter((r) => r && (r.give_up || r.net != null || r.gross != null));
   valid.forEach((r) => (res[r.name] = 0));
   if (valid.length < 2) return res;
 
@@ -216,18 +285,32 @@ export function settleHoleHeadEatsTail(rows, stake) {
   });
 
   const n = sorted.length;
-  const netOf = (i) => (sorted[i].give_up ? Infinity : sorted[i].net);
 
   // ชนตัดเจ๊า: cancel ONLY when the two paired players tie each other.
   // Ties between non-paired adjacent players do NOT cancel other pairings.
   for (let i = 0; i < Math.floor(n / 2); i++) {
-    const headIdx = i;
-    const tailIdx = n - 1 - i;
-    const headNet = netOf(headIdx);
-    const tailNet = netOf(tailIdx);
-    if (headNet !== tailNet) {
-      res[sorted[headIdx].name] += stake; // head (lower net) wins
-      res[sorted[tailIdx].name] -= stake; // tail (higher net) loses
+    const head = sorted[i];
+    const tail = sorted[n - 1 - i];
+
+    // give_up always loses the pairing; two give-ups cancel it
+    if (head.give_up || tail.give_up) {
+      if (head.give_up && tail.give_up) continue; // ชนตัดเจ๊า
+      const loser = head.give_up ? head : tail;
+      const winner = head.give_up ? tail : head;
+      res[winner.name] += stake;
+      res[loser.name] -= stake;
+      continue;
+    }
+
+    // Ranking above is field-relative; the PAYOUT is decided on this pair's own
+    // strokes, so the head can lose its pairing when the tail out-nets it there.
+    const cmp = comparePair(head, tail, ctx);
+    if (cmp < 0) {
+      res[head.name] += stake;
+      res[tail.name] -= stake;
+    } else if (cmp > 0) {
+      res[tail.name] += stake;
+      res[head.name] -= stake;
     }
     // else: ชนตัดเจ๊า — this specific pair ties, pairing void
   }
@@ -259,10 +342,13 @@ export function settleGame(game) {
     .map(Number)
     .sort((a, b) => a - b);
   const settleFn = game.format === "head_tail" ? settleHoleHeadEatsTail : settleHole;
+  const matrix = game.stroke_matrix || null;
   for (const hole of nums) {
     const mult = game.turbo && (game.turbo_holes || []).includes(hole) ? 2 : 1;
     const stake = (game.stake || 0) * mult;
-    const results = settleFn(game.holes[hole], stake);
+    const par =
+      game.course?.holes?.find((h) => Number(h.hole) === Number(hole))?.par ?? null;
+    const results = settleFn(game.holes[hole], stake, matrix ? { par, matrix } : null);
     for (const name in results) if (name in totals) totals[name] += results[name];
     perHole.push({ hole, turbo: mult > 1, stake, results });
   }

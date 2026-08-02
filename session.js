@@ -12,7 +12,13 @@ import {
   parseBulkScores,
   lookupPresetCourse,
 } from "./parser.js";
-import { settleHole, settleHoleHeadEatsTail, settleGame, scoreEmoji } from "./engine.js";
+import {
+  settleHole,
+  settleHoleHeadEatsTail,
+  settleGame,
+  scoreEmoji,
+  strokesBetween,
+} from "./engine.js";
 import { findCustomCourse, rememberCourse } from "./courseStore.js";
 import { saveRound } from "./db.js";
 import { emptyEnvelope } from "./handler.js";
@@ -49,12 +55,75 @@ function maybeStartRound(game, store) {
         `${holeAnnounce(game, 1)}\n` +
         `📝 ส่งสกอร์: "หลุม 1 [ชื่อ] [แต้ม]"\n` +
         `เช่น "หลุม 1 แซม 5 Muay 6"\n` +
-        `หรือส่งทีละคนก็ได้ เช่น "หลุม 1 แซม 5"`
+        `หรือส่งทีละคนก็ได้ เช่น "หลุม 1 แซม 5"\n` +
+        `⛳ เช็คก่อนออกรอบ: พิมพ์ "แต้มต่อ" ดูว่าใครต่อใครเท่าไร`
       );
     }
-    return `\n🏁 ผู้เล่นครบแล้ว! กรอกพาร์สนามก่อน เช่น "454354434 443535444"`;
+    return (
+      `\n🏁 ผู้เล่นครบแล้ว! กรอกพาร์สนามก่อน เช่น "454354434 443535444"\n` +
+      `⛳ เช็คก่อนออกรอบ: พิมพ์ "แต้มต่อ" ดูว่าใครต่อใครเท่าไร`
+    );
   }
   return "";
+}
+
+/** Strokes `receiver` gets from `giver` over the whole course, when pars are
+ *  known. Returns null when the course hasn't been entered yet. */
+function roundStrokes(game, receiver, giver) {
+  const holes = game.course?.holes;
+  if (!Array.isArray(holes) || holes.length === 0) return null;
+  return holes.reduce(
+    (sum, h) => sum + strokesBetween(game.stroke_matrix, receiver, giver, h.par),
+    0
+  );
+}
+
+/**
+ * Human-readable "who gives whom what" table for the current roster.
+ * Every pairing is classified on its OWN handicap gap, so this is the exact
+ * allocation settlement will use — meant to be checked BEFORE teeing off.
+ */
+export function handicapTable(game) {
+  const players = game.players || [];
+  if (players.length < 2) return `ยังมีผู้เล่นไม่พอ — ต้องมีอย่างน้อย 2 คน`;
+  if (!game.stroke_matrix) return `ยังคิดแต้มต่อไม่ได้ — ผู้เล่นยังเข้าร่วมไม่ครบ`;
+
+  const byIdx = [...players].sort((a, b) => a.handicap_index - b.handicap_index);
+  const lines = [`⛳ ตารางแต้มต่อ · ห้อง ${game.room_code}`, ""];
+  lines.push(`แต้มต่อ: ${byIdx.map((p) => `${p.name} ${p.handicap_index}`).join(" · ")}`);
+
+  // pairs that play straight up
+  const even = [];
+  for (let i = 0; i < byIdx.length; i++) {
+    for (let j = i + 1; j < byIdx.length; j++) {
+      const a = byIdx[i];
+      const b = byIdx[j];
+      const r = game.stroke_matrix[b.name]?.[a.name];
+      if (!r || (!r.par3 && !r.par4 && !r.par5)) {
+        even.push(`${a.name}–${b.name} (ห่าง ${b.handicap_index - a.handicap_index})`);
+      }
+    }
+  }
+  if (even.length) lines.push("", `🤝 เล่นตรงๆ ไม่ต่อกัน`, ...even.map((s) => `• ${s}`));
+
+  // everyone who receives something, weakest first
+  for (const p of [...byIdx].reverse()) {
+    const rows = byIdx
+      .filter((o) => o.name !== p.name)
+      .map((o) => ({ o, r: game.stroke_matrix[p.name]?.[o.name] }))
+      .filter(({ r }) => r && (r.par3 || r.par4 || r.par5))
+      .map(({ o, r }) => {
+        const gap = p.handicap_index - o.handicap_index;
+        const tot = roundStrokes(game, p.name, o.name);
+        const totTxt = tot == null ? "" : ` = ${tot} แต้ม`;
+        return `• จาก ${o.name} (ห่าง ${gap}) → พาร์3:${r.par3} พาร์4:${r.par4} พาร์5:${r.par5}${totTxt}`;
+      });
+    if (rows.length) lines.push("", `📥 ${p.name} รับแต้มต่อ`, ...rows);
+  }
+
+  if (!game.course) lines.push("", `(ยังไม่ได้กรอกพาร์สนาม — ยอดรวมต่อรอบจะขึ้นหลังกรอก)`);
+  lines.push("", `ตกลงกันแบบนี้ไหมครับ? แก้สกอร์ได้โดยพิมพ์ "เข้าร่วม" ใหม่`);
+  return lines.join("\n");
 }
 
 const WELCOME_TH =
@@ -63,7 +132,7 @@ const WELCOME_TH =
   `กรอกพาร์สนาม: "454354434 443535444"\n` +
   `เข้าร่วม: "เข้าร่วม แซม 105 90 91"\n` +
   `ลงแต้ม: "หลุม 1 A 5 B 6" หรือ "H1 แซม 4"\n` +
-  `สรุปเงิน: "รวม 18" · จบเกม: "จบเกม"`;
+  `ดูแต้มต่อ: "แต้มต่อ" · สรุปเงิน: "รวม 18" · จบเกม: "จบเกม"`;
 
 export function welcomeMessage() {
   return WELCOME_TH;
@@ -126,7 +195,8 @@ export function dispatch(text, sourceId, store) {
       let moneyLine = "";
       if (netComputed && r.game.stake) {
         const settleFn = r.game.format === "head_tail" ? settleHoleHeadEatsTail : settleHole;
-        holeMoney = settleFn(rows, stakeHole);
+        const ctx = r.game.stroke_matrix ? { par: r.par, matrix: r.game.stroke_matrix } : null;
+        holeMoney = settleFn(rows, stakeHole, ctx);
         moneyLine = `\n💰 หลุมนี้ (หลุมละ ${stakeHole}): ${fmtMoney(holeMoney)}`;
       }
       env.summary = {
@@ -236,6 +306,22 @@ export function dispatch(text, sourceId, store) {
       settlement: s.perPlayer,
     }).catch(() => {});
     store.cancelGame(sourceId);
+    return env;
+  }
+
+  if (intent === "handicap") {
+    const g = store.activeGame(sourceId);
+    const env = emptyEnvelope();
+    env.action = "handicap";
+    env.room_code = g?.room_code || null;
+    env.players = g?.players || [];
+    env.handicap_level = g?.handicap_level ?? null;
+    env.rules = g?.rules ?? null;
+    env.stroke_matrix = g?.stroke_matrix ?? null;
+    env.summary = {
+      ok: Boolean(g?.stroke_matrix && (g.players || []).length >= 2),
+      message: g ? handicapTable(g) : `ยังไม่มีเกม — พิมพ์ "สร้างเกม 4 คน" ก่อนครับ`,
+    };
     return env;
   }
 
@@ -377,7 +463,8 @@ export function dispatch(text, sourceId, store) {
     let moneyLine = "";
     if (netComputed && game.stake) {
       const settleFn = game.format === "head_tail" ? settleHoleHeadEatsTail : settleHole;
-      holeMoney = settleFn(rows, stakeHole);
+      const ctx = game.stroke_matrix ? { par: r.par, matrix: game.stroke_matrix } : null;
+      holeMoney = settleFn(rows, stakeHole, ctx);
       moneyLine = `\n💰 หลุมนี้ (หลุมละ ${stakeHole}): ${fmtMoney(holeMoney)}`;
     }
     // advance the round pointer + announce the next hole
@@ -680,20 +767,21 @@ function handleSetupAnswer(text, sourceId, store, game) {
       turbo_holes: g.turbo_holes,
       message:
         `${turboLine} ✅\nกติกาการแพ้ชนะครับ?\n` +
-        `1️⃣ กินกันทุกคน (ทุกคู่เปรียบสกอร์)\n` +
-        `2️⃣ หัวกินหาง (อันดับ 1 ชนะอันดับสุดท้าย)`,
+        `1️⃣ หัวกินหาง (อันดับ 1 ชนะอันดับสุดท้าย)\n` +
+        `2️⃣ กินกันทุกคน (ทุกคู่เปรียบสกอร์)`,
     };
     return env;
   }
 
   if (game.setup === 'format') {
-    const isAllVsAll = /^1$|กินกันทุกคน/i.test(t);
-    const isHeadTail = /^2$|หัวกินหาง/i.test(t);
+    // 1 = หัวกินหาง, 2 = กินกันทุกคน (menu order — keep in sync with the prompt above)
+    const isHeadTail = /^1$|หัวกินหาง/i.test(t);
+    const isAllVsAll = /^2$|กินกันทุกคน/i.test(t);
     if (!isAllVsAll && !isHeadTail) {
       env.summary = {
         ok: false,
         step: 'format',
-        message: 'เลือก "1" กินกันทุกคน หรือ "2" หัวกินหาง ครับ',
+        message: 'เลือก "1" หัวกินหาง หรือ "2" กินกันทุกคน ครับ',
       };
       return env;
     }
