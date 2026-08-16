@@ -46,6 +46,115 @@ export function generateRoomCode() {
   return String(Math.floor(Math.random() * 10000)).padStart(4, "0");
 }
 
+/* ----------------------------------------------------------------------------
+ * DATE-BASED ROOM CODES
+ *
+ * A live room code is DDMMYY + a 3-digit per-day running number, e.g.
+ * "160826001" = the 1st round created on 16 Aug 2026. The old 4-digit random
+ * codes repeated every few hundred games, so history could not be looked up by
+ * code; a date-stamped code is unique forever and readable at a glance.
+ *
+ * The date is ALWAYS the Thai calendar date (UTC+7), never the server's UTC
+ * date — Render runs in UTC, so a 06:00 Thai tee-off would otherwise be stamped
+ * with the previous day.
+ *
+ * Thailand is a FIXED +7 with no daylight saving, ever. So the offset is done
+ * with plain arithmetic rather than Intl/ICU: a Node build without full
+ * timezone data would make Intl fall back to UTC silently, and every early
+ * morning round would get yesterday's code. Arithmetic cannot fail that way.
+ * -------------------------------------------------------------------------- */
+
+/** Thailand time = UTC+7, all year round. */
+export const THAI_UTC_OFFSET_MIN = 7 * 60;
+
+/**
+ * Timezone used for room codes. A number is minutes east of UTC; a string is an
+ * IANA name resolved through Intl (only useful for tests / other countries).
+ * Override with ROOM_CODE_TZ_OFFSET_MIN (e.g. "480") or ROOM_CODE_TZ.
+ */
+export const ROOM_CODE_TZ =
+  process.env.ROOM_CODE_TZ ||
+  (process.env.ROOM_CODE_TZ_OFFSET_MIN
+    ? Number(process.env.ROOM_CODE_TZ_OFFSET_MIN)
+    : THAI_UTC_OFFSET_MIN);
+
+/**
+ * Calendar parts for an instant at a fixed UTC offset (minutes east of UTC).
+ * Shifting the epoch and then reading the UTC fields gives the local wall clock
+ * without touching Intl at all.
+ */
+export function partsAtOffset(date = new Date(), offsetMin = THAI_UTC_OFFSET_MIN) {
+  const d = new Date(date.getTime() + Number(offsetMin) * 60000);
+  return {
+    day: d.getUTCDate(),
+    month: d.getUTCMonth() + 1,
+    year: d.getUTCFullYear(),
+    hour: d.getUTCHours(),
+    minute: d.getUTCMinutes(),
+  };
+}
+
+const pad2 = (n) => String(n).padStart(2, "0");
+
+/** "16/08/26" -> "160826" for the given instant, in Thai time (UTC+7). */
+export function dateKeyDDMMYY(date = new Date(), tz = ROOM_CODE_TZ) {
+  if (typeof tz === "number") {
+    const p = partsAtOffset(date, tz);
+    return `${pad2(p.day)}${pad2(p.month)}${pad2(p.year % 100)}`;
+  }
+  // Named zone (tests, or a future non-Thai deployment) — needs ICU.
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: tz,
+    day: "2-digit",
+    month: "2-digit",
+    year: "2-digit",
+  }).formatToParts(date);
+  const get = (t) => parts.find((p) => p.type === t)?.value ?? "";
+  return `${get("day")}${get("month")}${get("year")}`;
+}
+
+/** "16/08/26 11:59" in Thai time — used for history timestamps. */
+export function formatThaiDateTime(date, offsetMin = THAI_UTC_OFFSET_MIN) {
+  if (date == null || date === "") return ""; // new Date(null) is the epoch, not "invalid"
+  const d = date instanceof Date ? date : new Date(date);
+  if (Number.isNaN(d.getTime())) return "";
+  const p = partsAtOffset(d, offsetMin);
+  return `${pad2(p.day)}/${pad2(p.month)}/${pad2(p.year % 100)} ${pad2(p.hour)}:${pad2(p.minute)}`;
+}
+
+/** Build a room code from a day key and a running number (1 -> "160826001"). */
+export function buildRoomCode(dateKey, seq) {
+  return `${dateKey}${String(seq).padStart(3, "0")}`;
+}
+
+/** Digits only — so "160826-001" and "ห้อง 160826 001" both resolve. */
+export function normalizeRoomCode(input) {
+  return String(input ?? "").replace(/\D/g, "");
+}
+
+/**
+ * Split a code into its parts. Returns null for anything that isn't a 9-digit
+ * date code (legacy 4-digit codes included — those have no date to read).
+ */
+export function parseRoomCode(input) {
+  const code = normalizeRoomCode(input);
+  if (!/^\d{9}$/.test(code)) return null;
+  const day = Number(code.slice(0, 2));
+  const month = Number(code.slice(2, 4));
+  const year = 2000 + Number(code.slice(4, 6));
+  const seq = Number(code.slice(6));
+  if (day < 1 || day > 31 || month < 1 || month > 12) return null;
+  return { dateKey: code.slice(0, 6), day, month, year, seq };
+}
+
+/** "160826001" -> "16/08/26" for display; non-date codes give null. */
+export function formatRoomCodeDate(input) {
+  const p = parseRoomCode(input);
+  if (!p) return null;
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${pad(p.day)}/${pad(p.month)}/${pad(p.year % 100)}`;
+}
+
 /**
  * Handicap from the last 3 rounds (spec rule #4).
  *   best = lowest score; weighted = (best*2 + other two) / 4, rounded.
@@ -250,24 +359,12 @@ export function validateCourse(course) {
  */
 export function settleHole(rows, stake, ctx = null) {
   const res = {};
-  const valid = (rows || []).filter((r) => r && (r.give_up || r.net != null || r.gross != null));
+  const valid = (rows || []).filter((r) => r && (r.net != null || r.gross != null));
   valid.forEach((r) => (res[r.name] = 0));
   for (let i = 0; i < valid.length; i++) {
     for (let j = i + 1; j < valid.length; j++) {
       const a = valid[i];
       const b = valid[j];
-      // give up (g) = loses to everyone; two give-ups tie
-      if (a.give_up && b.give_up) continue;
-      if (a.give_up) {
-        res[a.name] -= stake;
-        res[b.name] += stake;
-        continue;
-      }
-      if (b.give_up) {
-        res[b.name] -= stake;
-        res[a.name] += stake;
-        continue;
-      }
       const cmp = comparePair(a, b, ctx);
       if (cmp < 0) {
         res[a.name] += stake;
@@ -283,30 +380,23 @@ export function settleHole(rows, stake, ctx = null) {
 
 /**
  * Settle ONE hole head-eats-tail (หัวกินหาง).
- * Players ranked by net ascending (lower = better); give_up treated as Infinity.
+ * Players ranked by net ascending (lower = better).
  * Pair index-0 (head) vs index-N-1 (tail), index-1 vs index-N-2, …
  * A pairing fires only when BOTH players are "unique" — their net differs from
  * the player immediately above and below them in the ranking.
  * Tied adjacent players cancel the pairing ("ชนตัดเจ๊า").
  *
- * @param {{name:string, net?:number, give_up?:boolean}[]} rows
+ * @param {{name:string, net?:number}[]} rows
  * @param {number} stake - money per pair win (turbo already applied)
  * @returns {Object<string, number>} name -> amount won(+)/lost(-) this hole
  */
 export function settleHoleHeadEatsTail(rows, stake, ctx = null) {
   const res = {};
-  const valid = (rows || []).filter((r) => r && (r.give_up || r.net != null || r.gross != null));
+  const valid = (rows || []).filter((r) => r && (r.net != null || r.gross != null));
   valid.forEach((r) => (res[r.name] = 0));
   if (valid.length < 2) return res;
 
-  // Sort ascending by net; give_up players go to the tail (worst)
-  const sorted = [...valid].sort((a, b) => {
-    if (a.give_up && b.give_up) return 0;
-    if (a.give_up) return 1;
-    if (b.give_up) return -1;
-    return a.net - b.net;
-  });
-
+  const sorted = [...valid].sort((a, b) => a.net - b.net);
   const n = sorted.length;
 
   // ชนตัดเจ๊า: cancel ONLY when the two paired players tie each other.
@@ -314,16 +404,6 @@ export function settleHoleHeadEatsTail(rows, stake, ctx = null) {
   for (let i = 0; i < Math.floor(n / 2); i++) {
     const head = sorted[i];
     const tail = sorted[n - 1 - i];
-
-    // give_up always loses the pairing; two give-ups cancel it
-    if (head.give_up || tail.give_up) {
-      if (head.give_up && tail.give_up) continue; // ชนตัดเจ๊า
-      const loser = head.give_up ? head : tail;
-      const winner = head.give_up ? tail : head;
-      res[winner.name] += stake;
-      res[loser.name] -= stake;
-      continue;
-    }
 
     // Ranking above is field-relative; the PAYOUT is decided on this pair's own
     // strokes, so the head can lose its pairing when the tail out-nets it there.
@@ -343,7 +423,7 @@ export function settleHoleHeadEatsTail(rows, stake, ctx = null) {
 
 /** Emoji for a hole result vs par (gross == null means gave up). */
 export function scoreEmoji(gross, par) {
-  if (gross == null || par == null) return "🏳️"; // give up / unknown
+  if (gross == null || par == null) return "🏳️"; // not entered yet / par unknown
   const d = gross - par;
   if (d <= -2) return "🦅"; // eagle or better
   if (d === -1) return "🐦"; // birdie

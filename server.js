@@ -5,10 +5,16 @@
 
 import express from "express";
 import { GameStore, SESSION_TTL_MS } from "./gameStore.js";
-import { dispatch, welcomeMessage, isIdle } from "./session.js";
+import { dispatchAsync, welcomeMessage, isIdle } from "./session.js";
 import { verifySignature, replyJson, replyText } from "./line.js";
-import { initDb, dbEnabled, dbLastError } from "./db.js";
+import { initDb, dbEnabled, dbLastError, findRound, listRounds } from "./db.js";
 import { loadCoursesFromDb } from "./courseStore.js";
+import {
+  normalizeRoomCode,
+  dateKeyDDMMYY,
+  formatThaiDateTime,
+  THAI_UTC_OFFSET_MIN,
+} from "./engine.js";
 
 const PORT = process.env.PORT || 3000;
 const CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET || "";
@@ -43,11 +49,33 @@ app.get("/health", (_req, res) =>
     db_error: _dbStatus.error,
     keep_alive: Boolean(process.env.SELF_URL),
     session_ttl_hours: SESSION_TTL_MS / 3600000,
+    // Room codes are stamped with the Thai calendar date — check these two
+    // agree with a Thai wall clock after deploying, not the server's UTC time.
+    room_code_tz: `UTC+${THAI_UTC_OFFSET_MIN / 60}`,
+    thai_time_now: formatThaiDateTime(new Date()),
+    today_room_prefix: dateKeyDDMMYY(),
     live_games: store.rooms.size,
     uptime_min: Math.round(process.uptime() / 60), // small number = just cold-started
     started_at: new Date(Date.now() - process.uptime() * 1000).toISOString(),
   })
 );
+
+// Round history, for looking a round up from a browser rather than LINE.
+//   GET /rounds/160826001      -> that one round
+//   GET /rounds?source=<id>    -> that group's most recent rounds
+app.get("/rounds/:code", async (req, res) => {
+  await ready();
+  const row = await findRound(normalizeRoomCode(req.params.code));
+  if (!row) return res.status(404).json({ ok: false, error: "round not found" });
+  res.json({ ok: true, round: row });
+});
+
+app.get("/rounds", async (req, res) => {
+  await ready();
+  const sourceId = req.query.source;
+  if (!sourceId) return res.status(400).json({ ok: false, error: "source query param required" });
+  res.json({ ok: true, rounds: await listRounds(String(sourceId), Number(req.query.limit) || 10) });
+});
 
 // One game per LINE source: group > room > 1:1 user.
 function sourceIdOf(source = {}) {
@@ -96,10 +124,28 @@ async function tryConnectDb() {
   _dbStatus.error = ok ? null : dbLastError();
   if (!ok) return false;
   const [courses, sessions] = await Promise.all([loadCoursesFromDb(), store.loadFromDb()]);
+  // Archive anything that expired while the process was down/asleep, THEN seed
+  // today's running number — the sweep can add rounds that the seed must see.
+  const swept = await store.sweepExpired();
+  const seq = await store.seedRoomSeq();
   console.log(
-    `[caddiebot] DB ready — loaded ${courses} course(s), ${sessions} active session(s)`
+    `[caddiebot] DB ready — loaded ${courses} course(s), ${sessions} active session(s), ` +
+      `archived ${swept} expired round(s), room seq at ${seq}`
   );
   return true;
+}
+
+// Rounds that expire while nobody is typing exist only as a DB row, so no
+// in-memory expiry check ever sees them. Sweep on a timer so their history is
+// written while the data is still there.
+function startExpirySweep() {
+  const every = Number(process.env.SWEEP_MS || 30 * 60 * 1000);
+  setInterval(() => {
+    store
+      .sweepExpired()
+      .then((n) => n && console.log(`[caddiebot] archived ${n} expired round(s)`))
+      .catch((e) => console.error("[caddiebot] sweep error:", e.message));
+  }, every).unref?.();
 }
 
 async function bootstrap() {
@@ -155,7 +201,7 @@ export async function processEvent(ev) {
   }
 
   if (ev.message.type === "text") {
-    const payload = dispatch(ev.message.text, sourceId, store);
+    const payload = await dispatchAsync(ev.message.text, sourceId, store);
     // No live game (never started, or expired after 12h) -> total silence.
     // Only "สร้างเกม" / "สร้างเกมส์" wakes the bot back up.
     if (isIdle(payload)) return;
@@ -173,9 +219,10 @@ export async function processEvent(ev) {
 
 // Local test endpoint (no signature): POST {text, sourceId, ctx} -> JSON.
 // Use the same sourceId across calls to simulate one group chat.
-app.post("/simulate", (req, res) => {
+app.post("/simulate", async (req, res) => {
+  await ready();
   const { text, sourceId } = req.body || {};
-  res.json(dispatch(text ?? "", sourceId ?? "sim-default", store));
+  res.json(await dispatchAsync(text ?? "", sourceId ?? "sim-default", store));
 });
 
 // Render's free plan spins the instance down after ~15 min without traffic — and
@@ -201,6 +248,7 @@ if (isMain) {
     console.log(`[caddiebot] webhook listening on :${PORT}`);
     await ready();
     startKeepAlive();
+    startExpirySweep();
   });
 }
 

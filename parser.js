@@ -15,13 +15,16 @@ export function normalize(text) {
 
 /**
  * Decide what kind of message this is.
- * @returns {'course_json'|'create_game'|'join'|'hole_scores'|'par_string'|'bulk_scores'|'settle'|'end_game'|'handicap'|'unknown'}
+ * @returns {'course_json'|'create_game'|'join'|'hole_scores'|'par_string'|'bulk_scores'|'settle'|'end_game'|'handicap'|'history'|'unknown'}
  */
 export function detectIntent(text) {
   const raw = String(text ?? "");
   if (/^\s*[\[{]/.test(raw)) return "course_json"; // pasted JSON course
   const t = normalize(raw);
   if (/(จบเกม|จบ\s*เกม|end\s*game)/i.test(t)) return "end_game";
+  // History lookup — checked early so "ประวัติ" is never read as a score line,
+  // and it is the one command that works while the bot is otherwise idle.
+  if (/(ประวัติ|ประวัต|ย้อนหลัง|รอบเก่า|ดูรอบ|history)/i.test(t)) return "history";
   // Back-nine re-handicap — must beat the plain handicap question below.
   if (/(แต้มต่อใหม่|แต้มต่อเดิม|ใช้แต้มต่อใหม่|ใช้แต้มต่อเดิม|คิดแต้มต่อใหม่|เปลี่ยนแต้มต่อ)/i.test(t)) {
     return "back9_handicap";
@@ -47,7 +50,9 @@ export function detectIntent(text) {
   if (/^\d{16,20}$/.test(compact)) return "par_string"; // bare ~18-digit par card
   // Bulk per-player card: "แซม 544535445 445354454" (name + 18 single-digit holes).
   if (/^\S+\s+\d{9}\s+\d{9}$/.test(t) || /^\S+\s+\d{18}$/.test(t)) return "bulk_scores";
-  // Fallback: a 4-digit code plus several scores reads like a join.
+  // Fallback: a room code (9-digit date code or legacy 4-digit) plus several
+  // scores reads like a join, even without the "เข้าร่วม" keyword.
+  if (/\b\d{9}\b/.test(t) && (t.match(/\d{2,3}/g) || []).length >= 3) return "join";
   if (/\b\d{4}\b/.test(t) && (t.match(/\d{2,3}/g) || []).length >= 4) return "join";
   return "unknown";
 }
@@ -69,7 +74,9 @@ export function parseCreateGame(text) {
  */
 export function parseJoin(text) {
   const t = normalize(text);
-  const room = (t.match(/\b(\d{4})\b/) || [])[1] || null;
+  // Room code: the 9-digit date code (160826001) or a legacy 4-digit one. The
+  // 9-digit form MUST be matched first — otherwise it is chopped into "scores".
+  const room = (t.match(/\b(\d{9})\b/) || t.match(/\b(\d{4})\b/) || [])[1] || null;
   let rest = room ? t.replace(room, " ") : t; // don't mistake room code for a score
   rest = rest.replace(/^.*?(เข้าร่วม|join)\s*/i, ""); // drop the command word
   // Name: prefer an explicit "ชื่อ/name" keyword, else the first non-number word.
@@ -81,9 +88,34 @@ export function parseJoin(text) {
 }
 
 /**
+ * "ประวัติ 160826001" -> one round; bare "ประวัติ" -> this group's recent list.
+ * Accepts the code with separators ("160826-001") and legacy 4-digit codes.
+ * @returns {{code:string|null}}
+ */
+export function parseHistoryQuery(text) {
+  const t = normalize(text).replace(/(ประวัติ|ประวัต|ย้อนหลัง|รอบเก่า|ดูรอบ|history|ห้อง|room)/gi, " ");
+  const digits = (t.match(/\d[\d\s-]*/g) || [])
+    .map((s) => s.replace(/\D/g, ""))
+    .filter((s) => s.length >= 4);
+  const code = digits.find((d) => d.length === 9) || digits.find((d) => d.length === 4) || null;
+  return { code };
+}
+
+/**
  * "หลุม 1 A 5 B 6 C 5 D 7" (also multi-line, also Thai names).
  * @returns {{action, hole, players:{name,gross}[]}}
  */
+/** A hole score is always a number, 1–10. Anything higher is recorded as 10. */
+export const MIN_HOLE_SCORE = 1;
+export const MAX_HOLE_SCORE = 10;
+
+/** Clamp a typed score into the allowed range (11 -> 10, 0 -> 1). */
+export function clampHoleScore(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return null;
+  return Math.min(MAX_HOLE_SCORE, Math.max(MIN_HOLE_SCORE, Math.round(v)));
+}
+
 export function parseHoleScores(text) {
   const t = normalize(text);
   const holeMatch = t.match(/(?:หลุม|hole|รู|\bh)\s*[:：]?\s*(\d{1,2})/i);
@@ -91,12 +123,17 @@ export function parseHoleScores(text) {
   const rest = holeMatch ? t.replace(holeMatch[0], " ") : t;
 
   const players = [];
-  // value is a 1-2 digit score OR "g"/"G" = give up (แพ้หลุมนั้น)
-  const re = /([A-Za-z฀-๿][A-Za-z0-9฀-๿]*)\s*[:：]?\s*(\d{1,2}|[gG])\b/g;
+  // Scores are ALWAYS a number. There is no "give up" marker: a hole with no
+  // number is simply not recorded, which is far less error-prone than a special
+  // value that every settlement path then has to special-case.
+  const re = /([A-Za-z฀-๿][A-Za-z0-9฀-๿]*)\s*[:：]?\s*(\d{1,2})\b/g;
   let m;
   while ((m = re.exec(rest)) !== null) {
-    if (/^[gG]$/.test(m[2])) players.push({ name: m[1], gross: null, give_up: true });
-    else players.push({ name: m[1], gross: Number(m[2]) });
+    const raw = Number(m[2]);
+    const gross = clampHoleScore(raw);
+    const row = { name: m[1], gross };
+    if (gross !== raw) row.capped_from = raw; // so the bot can say it adjusted
+    players.push(row);
   }
   return { action: "hole_scores", hole, players };
 }

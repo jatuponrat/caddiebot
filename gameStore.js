@@ -5,6 +5,9 @@
 
 import {
   generateRoomCode,
+  dateKeyDDMMYY,
+  buildRoomCode,
+  parseRoomCode,
   calculateHandicap,
   classifyHandicapLevel,
   strokesForHole,
@@ -13,8 +16,18 @@ import {
   strokesBetween,
   computeNet,
   validateCourse,
+  settleGame,
 } from "./engine.js";
-import { saveSession, deleteSession, loadActiveSessions, loadSession } from "./db.js";
+import {
+  saveSession,
+  deleteSession,
+  loadActiveSessions,
+  loadSession,
+  saveRound,
+  maxRoomSeqForDay,
+  takeExpiredSessions,
+  deleteExpiredSession,
+} from "./db.js";
 
 // ROLLING 12-hour window: a game stays alive for 12 hours after the LAST
 // activity (setup answer, join, hole score, settle...). Every action pushes the
@@ -29,6 +42,29 @@ export class GameStore {
     this.rooms = new Map(); // room_code -> game
     this.activeBySource = new Map(); // sourceId (groupId/userId) -> room_code
     this._writes = new Map(); // sourceId -> promise chain (serializes DB writes)
+    this._seq = new Map(); // "160826" -> highest running number handed out that day
+  }
+
+  /**
+   * Seed today's running number from the database so a restart doesn't reissue
+   * codes that already exist. Called once at boot (server.js), and again lazily
+   * the first time a new day is seen. Safe to call with the DB disabled.
+   */
+  async seedRoomSeq(dateKey = dateKeyDDMMYY()) {
+    const n = await maxRoomSeqForDay(dateKey).catch(() => 0);
+    const current = this._seq.get(dateKey) || 0;
+    if (n > current) this._seq.set(dateKey, n);
+    return this._seq.get(dateKey) || 0;
+  }
+
+  /** Highest running number this process knows about for a day (live + seeded). */
+  _highestSeq(dateKey) {
+    let max = this._seq.get(dateKey) || 0;
+    for (const code of this.rooms.keys()) {
+      const p = parseRoomCode(code);
+      if (p && p.dateKey === dateKey && p.seq > max) max = p.seq;
+    }
+    return max;
   }
 
   /** Queue a DB write for a source. Writes for the same source_id run in the
@@ -62,6 +98,12 @@ export class GameStore {
     this._queue(sourceId, () => deleteSession(sourceId), "delete");
   }
 
+  /** Delete ONLY if the stored row is still expired. A plain DELETE here could
+   *  wipe a game created after the sweep's query ran; this one cannot. */
+  _persistDeleteExpired(sourceId) {
+    this._queue(sourceId, () => deleteExpiredSession(sourceId), "delete-expired");
+  }
+
   /** Restore active sessions from DB into memory (call once at startup). */
   async loadFromDb() {
     const rows = await loadActiveSessions();
@@ -75,7 +117,22 @@ export class GameStore {
     return n;
   }
 
+  /**
+   * Next room code: DDMMYY (Bangkok) + a 3-digit running number for that day,
+   * e.g. "160826001". Falls back to the legacy random 4-digit code only if a
+   * day somehow overflows 999 rounds.
+   */
   _newCode() {
+    const dateKey = dateKeyDDMMYY();
+    let seq = this._highestSeq(dateKey) + 1;
+    while (seq <= 999) {
+      const code = buildRoomCode(dateKey, seq);
+      if (!this.rooms.has(code)) {
+        this._seq.set(dateKey, seq);
+        return code;
+      }
+      seq++;
+    }
     let code;
     let tries = 0;
     do {
@@ -88,8 +145,95 @@ export class GameStore {
     return Boolean(game && game.expires_at && Date.now() > game.expires_at);
   }
 
-  _drop(game) {
+  /**
+   * Write a round into the permanent `rounds` history. Idempotent — the row is
+   * keyed on the room code, so settling twice (or settling and then ending)
+   * updates the same row instead of duplicating it.
+   *
+   * Called on EVERY path that destroys a game: "จบเกม", "รวม 18", the 12h
+   * expiry, and "สร้างเกม" overwriting an abandoned round. Before this, a group
+   * that simply stopped typing lost the round entirely.
+   *
+   * @param {object} game
+   * @param {"ended"|"settled"|"expired"|"replaced"} reason
+   */
+  archiveGame(game, reason = "ended") {
+    if (!game?.room_code) return null;
+    // Nothing was played — an abandoned setup is not worth a history row.
+    if (!game.holes || Object.keys(game.holes).length === 0) return null;
+    const s = settleGame(game);
+    const round = {
+      archive_key: game.room_code,
+      room_code: game.room_code,
+      source_id: game.source_id ?? null,
+      course_name: game.course_name ?? null,
+      stake: game.stake ?? null,
+      turbo: game.turbo ?? null,
+      format: game.format ?? null,
+      ended_reason: reason,
+      players: game.players ?? [],
+      holes: game.holes ?? {},
+      course: game.course ?? null,
+      settlement: s.perPlayer,
+      holes_counted: s.holesCounted,
+      created_at_ms: game.created_at ?? null,
+    };
+    game.archived_reason = reason;
+    // Fire-and-forget on the source's write queue so it can never race the
+    // session DELETE that follows.
+    if (game.source_id) this._queue(game.source_id, () => saveRound(round), "archive");
+    else saveRound(round).catch((e) => console.error("[store] archive error:", e.message));
+    return round;
+  }
+
+  /**
+   * Archive + delete every session whose 12h window has already elapsed.
+   * Games that expire while the bot is idle are never touched by the in-memory
+   * expiry checks (nothing is in memory), so without this sweep they would be
+   * deleted by nothing and simply linger, then vanish on the next restart.
+   * Run at boot and on a timer from server.js.
+   */
+  async sweepExpired() {
+    const rows = await takeExpiredSessions().catch(() => []);
+    let n = 0;
+    for (const row of rows) if (this._sweepRow(row)) n++;
+    return n;
+  }
+
+  /**
+   * Retire ONE expired session. Split out from sweepExpired so the ordering
+   * hazard below is testable.
+   *
+   * The query in sweepExpired takes real time, and a group can type "สร้างเกม"
+   * in that window. If we blindly cleaned up every row the query returned, the
+   * sweep would delete the session row and the in-memory mapping of the BRAND
+   * NEW game — the bot would go silent immediately after being woken up, which
+   * looks exactly like the timeout bug this feature exists to prevent. So a
+   * source that is live again is left completely alone: createGame already
+   * archived the old round as "replaced" and overwrote its row.
+   *
+   * @returns {boolean} true if this row was archived
+   */
+  _sweepRow({ sourceId, game }) {
+    if (!game?.room_code) {
+      if (sourceId) this._persistDeleteExpired(sourceId);
+      return false;
+    }
+    const liveCode = sourceId ? this.activeBySource.get(sourceId) : null;
+    if (liveCode && liveCode !== game.room_code) return false; // superseded — hands off
+
+    this.archiveGame({ ...game, source_id: game.source_id || sourceId }, "expired");
+    if (sourceId) this._persistDeleteExpired(sourceId);
+    this.rooms.delete(game.room_code);
+    if (sourceId && this.activeBySource.get(sourceId) === game.room_code) {
+      this.activeBySource.delete(sourceId);
+    }
+    return true;
+  }
+
+  _drop(game, reason = "expired") {
     if (!game) return;
+    this.archiveGame(game, reason); // save history BEFORE the state is thrown away
     this._persistDelete(game.source_id); // clean up expired session from DB
     this.rooms.delete(game.room_code);
     if (game.source_id && this.activeBySource.get(game.source_id) === game.room_code) {
@@ -162,7 +306,7 @@ export class GameStore {
     // "สร้างเกม" always starts from a clean slate — discard whatever this
     // source had before (finished, abandoned or expired).
     if (sourceId && this.activeBySource.has(sourceId)) {
-      this._drop(this.rooms.get(this.activeBySource.get(sourceId)));
+      this._drop(this.rooms.get(this.activeBySource.get(sourceId)), "replaced");
       this.activeBySource.delete(sourceId);
     }
     const room_code = this._newCode();
@@ -310,9 +454,10 @@ export class GameStore {
     return game;
   }
 
-  cancelGame(sourceId) {
+  cancelGame(sourceId, reason = "ended") {
     const game = this._resolve(null, sourceId);
     if (!game) return false;
+    if (game.archived_reason !== reason) this.archiveGame(game, reason);
     this._persistDelete(game.source_id); // explicit delete (not via _drop to avoid double-call)
     this.rooms.delete(game.room_code);
     if (game.source_id && this.activeBySource.get(game.source_id) === game.room_code) {
@@ -419,7 +564,7 @@ export class GameStore {
       let complete = true;
       for (let h = 1; h <= 9; h++) {
         const row = (game.holes?.[h] || []).find((r) => r.name === p.name);
-        const g = row && !row.give_up ? row.gross : null;
+        const g = row ? row.gross ?? null : null;
         holes.push(g);
         if (g == null) complete = false;
         else total += g;
@@ -472,7 +617,7 @@ export class GameStore {
       const par = game.course.holes.find((h) => Number(h.hole) === Number(holeNum))?.par ?? null;
       if (par == null) continue;
       for (const row of rows) {
-        if (row.give_up || row.gross == null) continue;
+        if (row.gross == null) continue;
         const strokes = this._displayStrokes(game, row.name, par, Number(holeNum));
         row.strokes = strokes;
         row.net = computeNet(row.gross, strokes);
@@ -495,17 +640,12 @@ export class GameStore {
     const arr = game.holes[hole] || (game.holes[hole] = []);
 
     for (const p of players) {
-      const row = { name: p.name };
-      if (p.give_up) {
-        row.give_up = true;
-        row.gross = null;
-      } else {
-        row.gross = p.gross;
-        if (canNet) {
-          const strokes = this._displayStrokes(game, p.name, par, Number(hole));
-          row.strokes = strokes;
-          row.net = computeNet(p.gross, strokes);
-        }
+      // Scores are numbers only — the parser has already clamped them to 1-10.
+      const row = { name: p.name, gross: p.gross };
+      if (canNet) {
+        const strokes = this._displayStrokes(game, p.name, par, Number(hole));
+        row.strokes = strokes;
+        row.net = computeNet(p.gross, strokes);
       }
       const idx = arr.findIndex((r) => r.name === p.name);
       if (idx >= 0) arr[idx] = row;

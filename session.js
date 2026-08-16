@@ -10,7 +10,9 @@ import {
   parseHoleScores,
   parseParString,
   parseBulkScores,
+  parseHistoryQuery,
   lookupPresetCourse,
+  MAX_HOLE_SCORE,
 } from "./parser.js";
 import {
   settleHole,
@@ -19,9 +21,12 @@ import {
   scoreEmoji,
   strokesBetween,
   classifyHandicapLevel,
+  formatRoomCodeDate,
+  normalizeRoomCode,
+  formatThaiDateTime,
 } from "./engine.js";
 import { findCustomCourse, rememberCourse } from "./courseStore.js";
-import { saveRound } from "./db.js";
+import { findRound, listRounds } from "./db.js";
 import { emptyEnvelope } from "./handler.js";
 
 /** "A +40, B −20, C 0" — format a {name: amount} money map for chat. */
@@ -414,20 +419,11 @@ export function dispatch(text, sourceId, store) {
       message:
         `จบเกมแล้ว ✅\n` +
         `สนาม ${g.course_name || "-"} · ผู้เล่น: ${names} · ${holesPlayed}/18 หลุม` +
-        settleLine,
+        settleLine +
+        `\n📒 ห้อง ${g.room_code} — ดูย้อนหลังได้ด้วย "ประวัติ ${g.room_code}"`,
     };
-    // persist the round for history (no-op if DB disabled)
-    saveRound({
-      room_code: g.room_code,
-      source_id: sourceId,
-      course_name: g.course_name,
-      stake: g.stake,
-      turbo: g.turbo,
-      players: g.players,
-      holes: g.holes,
-      settlement: s.perPlayer,
-    }).catch(() => {});
-    store.cancelGame(sourceId);
+    // cancelGame archives the round to `rounds` before wiping the session.
+    store.cancelGame(sourceId, "ended");
     return env;
   }
 
@@ -499,15 +495,29 @@ export function dispatch(text, sourceId, store) {
     if (!parsed.players || parsed.players.length === 0) {
       const hint = store.activeGame(sourceId);
       const names = hint ? hint.players.map((p) => p.name).filter(Boolean).join(", ") : "";
+      // "g" used to mean "give up". It no longer exists — say so plainly
+      // instead of leaving the group staring at a generic parse error.
+      const usedGiveUp = /(^|\s)[gG]($|\s)/.test(String(text));
       env.summary = {
         ok: false,
-        message:
-          `อ่านชื่อ/แต้มไม่ได้ — ส่งสกอร์แบบนี้ครับ:\n` +
-          `"หลุม ${parsed.hole || 1} [ชื่อ] [แต้ม]" หรือ "H${parsed.hole || 1} [ชื่อ] [แต้ม]"\n` +
-          (names ? `ชื่อผู้เล่น: ${names}` : ""),
+        message: usedGiveUp
+          ? `ไม่มี "g" (ยอมแพ้) แล้วครับ — ใส่สกอร์เป็นตัวเลขเสมอ (สูงสุด ${MAX_HOLE_SCORE})\n` +
+            `เช่น "หลุม ${parsed.hole || 1} ${names.split(", ")[0] || "ชื่อ"} 8"` +
+            (names ? `\nชื่อผู้เล่น: ${names}` : "")
+          : `อ่านชื่อ/แต้มไม่ได้ — ส่งสกอร์แบบนี้ครับ:\n` +
+            `"หลุม ${parsed.hole || 1} [ชื่อ] [แต้ม]" หรือ "H${parsed.hole || 1} [ชื่อ] [แต้ม]"\n` +
+            `แต้มต้องเป็นตัวเลข 1–${MAX_HOLE_SCORE}\n` +
+            (names ? `ชื่อผู้เล่น: ${names}` : ""),
       };
       return env;
     }
+
+    // Tell the group when a typed score was pulled down to the 10 ceiling, so
+    // a fat-fingered "12" is never silently recorded as something else.
+    const cappedNote = parsed.players
+      .filter((p) => p.capped_from != null)
+      .map((p) => `${p.name} ${p.capped_from}→${p.gross}`)
+      .join(", ");
 
     // Reject scores submitted under a name that isn't in the registered roster.
     // "ไม่ต้องแจ้งรับ" — don't confirm; only warn and stop.
@@ -577,7 +587,8 @@ export function dispatch(text, sourceId, store) {
         complete: false,
         message:
           `รับหลุม ${hole}: ${got || "-"} ✅` +
-          (registered.length ? ` (รออีก: ${waiting.join(", ")})` : ""),
+          (registered.length ? ` (รออีก: ${waiting.join(", ")})` : "") +
+          (cappedNote ? `\n⚠️ ปรับเป็นสูงสุด ${MAX_HOLE_SCORE}: ${cappedNote}` : ""),
       };
       return env;
     }
@@ -638,7 +649,9 @@ export function dispatch(text, sourceId, store) {
       money: holeMoney,
       turn_summary: Boolean(turnLine),
       message:
-        `หลุม ${hole} ครบทุกคน ✅${turboTag}${moneyLine}${turnLine}` +
+        `หลุม ${hole} ครบทุกคน ✅${turboTag}` +
+        (cappedNote ? `\n⚠️ ปรับเป็นสูงสุด ${MAX_HOLE_SCORE}: ${cappedNote}` : "") +
+        `${moneyLine}${turnLine}` +
         (turnLine ? `\n${nextLine}` : nextLine),
     };
     return env;
@@ -746,13 +759,19 @@ export function dispatch(text, sourceId, store) {
     }
     store.save(g); // asking for the money is real activity — renew the 12h window
     const s = settleGame(g);
+    // Snapshot to history now: plenty of groups settle with "รวม 18" and then
+    // just stop typing, so this may be the last time the round is ever seen.
+    // Idempotent — "จบเกม" later updates the same row.
+    store.archiveGame(g, "settled");
     env.players = g.players;
+    env.room_code = g.room_code;
     env.summary = {
       ok: true,
       holes_counted: s.holesCounted,
       per_player: s.perPlayer,
       message: s.holesCounted
-        ? `สรุปเงินรวม ${s.holesCounted} หลุม 💰\n${fmtMoney(s.perPlayer)}\n(บวก = ได้ / ลบ = จ่าย)`
+        ? `สรุปเงินรวม ${s.holesCounted} หลุม 💰\n${fmtMoney(s.perPlayer)}\n(บวก = ได้ / ลบ = จ่าย)\n` +
+          `📒 ห้อง ${g.room_code} — ดูย้อนหลังได้ด้วย "ประวัติ ${g.room_code}"`
         : "ยังไม่มีสกอร์ที่บันทึก — ลงแต้มก่อนนะครับ",
     };
     return env;
@@ -1034,4 +1053,144 @@ function handleSetupAnswer(text, sourceId, store, game) {
   env.action = 'unknown';
   env.summary = { ok: false, message: '' };
   return env;
+}
+
+/* ----------------------------------------------------------------------------
+ * HISTORY — reading rounds back out of the `rounds` table
+ *
+ * This is the one command that must answer while the bot is otherwise idle:
+ * a group looks up an old round precisely because the game is long gone. It
+ * needs the database, so it lives on the async path (dispatchAsync) rather than
+ * inside the synchronous dispatch().
+ * -------------------------------------------------------------------------- */
+
+const ENDED_REASON_TH = {
+  ended: "จบเกม",
+  settled: "รวมเงินแล้ว",
+  expired: "หมดเวลา 12 ชม.",
+  replaced: "ถูกสร้างเกมใหม่ทับ",
+};
+
+/** "16/08/26 07:12" in Thai time (UTC+7), from a DB timestamp. */
+function fmtWhen(ts) {
+  return ts ? formatThaiDateTime(ts) : "";
+}
+
+/** Total gross per player across an archived `holes` object. */
+function grossTotals(holes) {
+  const totals = {};
+  for (const rows of Object.values(holes || {})) {
+    for (const row of rows || []) {
+      if (!row?.name) continue;
+      totals[row.name] = totals[row.name] || { gross: 0, played: 0 };
+      if (row.gross == null) continue; // hole never got a number
+      totals[row.name].gross += Number(row.gross);
+      totals[row.name].played++;
+    }
+  }
+  return totals;
+}
+
+function formatRoundDetail(row) {
+  const code = row.archive_key || row.room_code;
+  const dateLabel = formatRoomCodeDate(code) || fmtWhen(row.created_at);
+  const settlement = row.settlement || {};
+  const players = Array.isArray(row.players) ? row.players : [];
+  const totals = grossTotals(row.holes);
+
+  const head = `📒 ประวัติ ห้อง ${code}${dateLabel ? ` · ${dateLabel}` : ""}`;
+  const setup = [
+    row.course_name ? `สนาม ${row.course_name}` : null,
+    row.stake != null ? `หลุมละ ${row.stake}` : null,
+    row.turbo ? "เทอร์โบ 🔥" : null,
+    row.format === "head_tail" ? "หัวกินหาง" : row.format === "all_vs_all" ? "กินกันทุกคน" : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  const hcpLine = players.length
+    ? `แต้มต่อ: ${players.map((p) => `${p.name} ${p.handicap_index}`).join(" · ")}`
+    : "";
+
+  const moneyLine = Object.keys(settlement).length
+    ? `\n💰 สรุปเงิน (${row.holes_counted ?? "-"} หลุม)\n${fmtMoney(settlement)}\n(บวก = ได้ / ลบ = จ่าย)`
+    : "\n(รอบนี้ไม่มีสกอร์ที่บันทึกไว้)";
+
+  const cardLines = Object.entries(totals)
+    .sort((a, b) => a[1].gross - b[1].gross)
+    .map(([name, t]) => `${name} ${t.gross} (${t.played} หลุม)`);
+  const cardBlock = cardLines.length ? `\n\n📋 สกอร์รวม\n${cardLines.join("\n")}` : "";
+
+  const status = ENDED_REASON_TH[row.ended_reason] || row.ended_reason || "";
+  const when = fmtWhen(row.updated_at || row.created_at);
+
+  return (
+    `${head}\n${setup}` +
+    (hcpLine ? `\n${hcpLine}` : "") +
+    moneyLine +
+    cardBlock +
+    (status ? `\n\nสถานะ: ${status}${when ? ` · ${when}` : ""}` : "")
+  );
+}
+
+function formatRoundList(rows) {
+  const lines = rows.map((r, i) => {
+    const code = r.archive_key || r.room_code;
+    const when = formatRoomCodeDate(code) || fmtWhen(r.created_at);
+    const money = Object.keys(r.settlement || {}).length ? fmtMoney(r.settlement) : "—";
+    return `${i + 1}. ${code} · ${when} · ${r.course_name || "-"} · ${r.holes_counted ?? "-"} หลุม\n   ${money}`;
+  });
+  return (
+    `📒 ${rows.length} รอบล่าสุดของกลุ่มนี้\n\n${lines.join("\n")}\n\n` +
+    `ดูละเอียด: พิมพ์ "ประวัติ [เลขห้อง]"`
+  );
+}
+
+/** Build the reply for a history request. Always answers — never silent. */
+export async function historyReply(text, sourceId, store = null) {
+  const env = emptyEnvelope();
+  env.action = "history";
+  const { code } = parseHistoryQuery(text);
+
+  if (code) {
+    const row = await findRound(normalizeRoomCode(code)).catch(() => null);
+    env.room_code = code;
+    if (!row) {
+      const live = store?.activeGame?.(sourceId);
+      env.summary = {
+        ok: false,
+        message:
+          `ไม่พบประวัติของห้อง ${code} ครับ\n` +
+          (live ? `(ห้องที่กำลังเล่นอยู่ตอนนี้คือ ${live.room_code})\n` : "") +
+          `ลองพิมพ์ "ประวัติ" เฉยๆ เพื่อดูรอบล่าสุดของกลุ่มนี้`,
+      };
+      return env;
+    }
+    env.players = Array.isArray(row.players) ? row.players : [];
+    env.summary = { ok: true, round: row, message: formatRoundDetail(row) };
+    return env;
+  }
+
+  const rows = await listRounds(sourceId, 5).catch(() => []);
+  if (!rows.length) {
+    const live = store?.activeGame?.(sourceId);
+    env.summary = {
+      ok: false,
+      message: live
+        ? `ยังไม่มีรอบที่จบในกลุ่มนี้ครับ\n(ห้องที่กำลังเล่นอยู่: ${live.room_code})`
+        : `ยังไม่มีประวัติการแข่งของกลุ่มนี้ครับ`,
+    };
+    return env;
+  }
+  env.summary = { ok: true, rounds: rows, message: formatRoundList(rows) };
+  return env;
+}
+
+/**
+ * Async front door. Identical to dispatch() for every command except "ประวัติ",
+ * which needs a database round-trip. server.js and /simulate both use this.
+ */
+export async function dispatchAsync(text, sourceId, store) {
+  if (detectIntent(text) === "history") return historyReply(text, sourceId, store);
+  return dispatch(text, sourceId, store);
 }
