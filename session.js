@@ -127,6 +127,35 @@ export function frontNineCard(game, store) {
   return lines.join("\n");
 }
 
+/**
+ * The saved par card, read back. Groups check this before teeing off — an
+ * auto-loaded course is worth a second pair of eyes, since every stroke and
+ * every baht is computed from these 18 numbers.
+ */
+export function parCardMessage(game) {
+  const holes = game?.course?.holes || game?.pending_course?.holes || null;
+  if (!holes || holes.length !== 18) return null;
+  const pars = holes
+    .slice()
+    .sort((a, b) => Number(a.hole) - Number(b.hole))
+    .map((h) => Number(h.par));
+  const out = pars.slice(0, 9).reduce((a, b) => a + b, 0);
+  const inn = pars.slice(9).reduce((a, b) => a + b, 0);
+  const turbo = game.turbo ? game.turbo_holes || [] : [];
+  const row = (from) => pars.slice(from, from + 9).join(" ");
+  const lines = [
+    `📋 พาร์สนาม ${game.course_name || "-"} — รวม ${out + inn}`,
+    ``,
+    `หลุม 1-9   ${row(0)}  (OUT ${out})`,
+    `หลุม 10-18 ${row(9)}  (IN ${inn})`,
+  ];
+  if (turbo.length) lines.push(`🔥 หลุมเทอร์โบ (เงินคูณ 2): ${turbo.join(", ")}`);
+  if (!game.course && game.pending_course) {
+    lines.push(`⚠️ ยังไม่ได้ยืนยัน — พิมพ์ "ยืนยัน" ถ้าถูกต้อง หรือ "แก้ไข" เพื่อกรอกใหม่`);
+  }
+  return lines.join("\n");
+}
+
 /** What the new back-nine handicaps would be: front-nine gross x 2. */
 export function back9Preview(game, store) {
   const front = store.frontNine(game);
@@ -429,6 +458,26 @@ export function dispatch(text, sourceId, store) {
       return env;
     }
     // anything else — fall through and handle it normally
+  }
+
+  // "ดูพาร์" — a read, so it is answered even while the setup Q&A is open and
+  // never counts as an answer to the question being asked.
+  if (intent === "show_par") {
+    const g = store.activeGame(sourceId);
+    const env = emptyEnvelope();
+    env.action = "show_par";
+    env.room_code = g?.room_code || null;
+    env.course = g?.course ?? null;
+    const card = g ? parCardMessage(g) : null;
+    env.summary = card
+      ? { ok: true, total_par: (g.course || g.pending_course)?.total ?? null, message: card }
+      : {
+          ok: false,
+          message:
+            `ยังไม่ได้บันทึกพาร์สนามครับ\n` +
+            `พิมพ์ชื่อสนาม หรือกรอกพาร์ 18 หลุม เช่น "454354434 443535444"`,
+        };
+    return env;
   }
 
   // Cancel a game that is mid-setup.
@@ -1149,7 +1198,8 @@ export function dispatch(text, sourceId, store) {
   env.summary = {
     ok: false,
     message:
-      `พิมพ์ "สร้างเกม", "กรอกพาร์ 454354434 443535444", "เข้าร่วม แซม 105 90 91", หรือ "หลุม 1 A 5 B 6"`,
+      `พิมพ์ "สร้างเกม", "กรอกพาร์ 454354434 443535444", "เข้าร่วม แซม 105 90 91", ` +
+      `"หลุม 1 A 5 B 6" หรือ "ดูพาร์" เพื่อเช็กพาร์สนาม`,
   };
   return env;
 }

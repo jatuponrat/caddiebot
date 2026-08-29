@@ -36,6 +36,16 @@ export function detectIntent(text) {
     if (j.player && j.scores.length >= 3) return "join";
   }
 
+  // "ดูพาร์" / "เช็คพาร์" — read the saved card back. Checked before the
+  // par-card and command patterns, but only when the line carries no par card
+  // of its own, so "พาร์ 454354434 443535444" still SETS the pars.
+  if (
+    /(ดูพาร์|เช็คพาร์|เช็กพาร์|ขอพาร์|พาร์สนาม|ดูสนาม|ขอดูพาร์|show\s*par|check\s*par)/i.test(t) &&
+    (t.replace(/\D/g, "").length < 10)
+  ) {
+    return "show_par";
+  }
+
   if (/(จบเกม|จบ\s*เกม|end\s*game)/i.test(t)) return "end_game";
   // History lookup — checked early so "ประวัติ" is never read as a score line,
   // and it is the one command that works while the bot is otherwise idle.
