@@ -46,6 +46,12 @@ export function detectIntent(text) {
     return "show_par";
   }
 
+  // "สถานะ" — one screen with everyone's score, handicap and money. Checked
+  // before `settle` because "สรุปสถานะ" contains สรุป.
+  if (/(สถานะ|ดูสถานะ|สรุปสถานะ|ตอนนี้เป็นไง|ถึงไหนแล้ว|ล่าสุดเป็นไง|\bstatus\b)/i.test(t)) {
+    return "status";
+  }
+
   if (/(จบเกม|จบ\s*เกม|end\s*game)/i.test(t)) return "end_game";
   // History lookup — checked early so "ประวัติ" is never read as a score line,
   // and it is the one command that works while the bot is otherwise idle.

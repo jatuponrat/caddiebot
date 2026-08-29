@@ -254,6 +254,89 @@ export function standingsMessage(game, title = null) {
   return lines.join("\n");
 }
 
+/**
+ * One screen with everything a group asks between holes: how each player is
+ * scoring, what handicap they are playing off, and where the money stands.
+ * Answerable at ANY point in the round, including before the first hole.
+ */
+export function statusMessage(game, store) {
+  const s = settleGame(game);
+  const players = game.players || [];
+  if (!players.length) {
+    return `ยังไม่มีผู้เล่นในห้องนี้ครับ — พิมพ์ "เข้าร่วม [ชื่อ] [สกอร์ 3 รอบ]"`;
+  }
+
+  // Gross so far, and the par for exactly the holes THAT player has played, so
+  // "+3" always compares like with like even when someone is a hole behind.
+  const stats = {};
+  for (const p of players) stats[p.name] = { holes: 0, gross: 0, par: 0 };
+  for (const [holeNum, rows] of Object.entries(game.holes || {})) {
+    const par = parForHole(game, Number(holeNum));
+    for (const row of rows || []) {
+      const st = stats[row.name];
+      if (!st || row.gross == null) continue;
+      st.holes += 1;
+      st.gross += row.gross;
+      if (par != null) st.par += par;
+    }
+  }
+
+  const money = s.perPlayer || {};
+  const ranked = [...players].sort(
+    (a, b) => (money[b.name] || 0) - (money[a.name] || 0) || a.name.localeCompare(b.name)
+  );
+  const pad = Math.max(...players.map((p) => p.name.length));
+
+  const header =
+    `📊 สถานะล่าสุด · ห้อง ${game.room_code}` +
+    (s.holesCounted ? ` (เล่นไปแล้ว ${s.holesCounted}/18 หลุม)` : " (ยังไม่เริ่มลงสกอร์)");
+  const lines = [header, ""];
+
+  for (const p of ranked) {
+    const st = stats[p.name];
+    const vsPar =
+      st.holes && st.par ? ` (${st.gross - st.par >= 0 ? "+" : ""}${st.gross - st.par})` : "";
+    const behind = st.holes && st.holes < s.holesCounted ? ` ⚠️ ลง ${st.holes} หลุม` : "";
+    const scorePart = st.holes ? `สกอร์ ${st.gross}${vsPar}` : "ยังไม่มีสกอร์";
+    const amt = money[p.name] || 0;
+    const moneyPart =
+      !game.stake || !s.holesCounted
+        ? "เงิน —"
+        : amt > 0
+          ? `เงิน +${amt}`
+          : amt < 0
+            ? `เงิน −${Math.abs(amt)}`
+            : "เงิน 0";
+    lines.push(
+      `${p.name.padEnd(pad)}  ${scorePart} · แต้มต่อ ${p.handicap_index} · ${moneyPart}${behind}`
+    );
+  }
+
+  const tail = [];
+  if (game.stake) {
+    tail.push(`หลุมละ ${game.stake}${game.turbo ? ` (เทอร์โบ ${(game.turbo_holes || []).join(", ")} 🔥)` : ""}`);
+  } else {
+    tail.push("ยังไม่ได้ตั้งเงินเดิมพัน — พิมพ์ \"หลุมละ 20\"");
+  }
+  if (game.format) tail.push(game.format === "head_tail" ? "หัวกินหาง" : "กินกันทุกคน");
+  if (game.back9_handicap) tail.push("ใช้แต้มต่อใหม่สำหรับ 9 หลุมหลังแล้ว");
+  lines.push("", tail.join(" · "));
+
+  // Where the round is right now.
+  if (game.current_hole && game.current_hole <= 18) {
+    lines.push(holeAnnounce(game, game.current_hole).replace("เริ่ม !!", "กำลังเล่น"));
+    const waiting = (game.players || [])
+      .map((p) => p.name)
+      .filter((n) => !(game.holes?.[game.current_hole] || []).some((r) => r.name === n));
+    if (waiting.length && waiting.length < players.length) {
+      lines.push(`รออีก: ${waiting.join(", ")}`);
+    }
+  } else if (s.holesCounted >= 18) {
+    lines.push(`🏁 ครบ 18 หลุมแล้ว — พิมพ์ "รวม 18" หรือ "จบเกม" เพื่อสรุปเงิน`);
+  }
+  return lines.join("\n");
+}
+
 /** Stroke rules for a gap, for display. */
 function rulesForGap(gap) {
   return classifyHandicapLevel(gap).rules;
@@ -458,6 +541,27 @@ export function dispatch(text, sourceId, store) {
       return env;
     }
     // anything else — fall through and handle it normally
+  }
+
+  // "สถานะ" — everyone's score, handicap and money on one screen, at any point.
+  if (intent === "status") {
+    const g = store.activeGame(sourceId);
+    const env = emptyEnvelope();
+    env.action = "status";
+    env.room_code = g?.room_code || null;
+    if (!g) {
+      env.summary = { ok: false, message: `ยังไม่มีเกมในกลุ่มนี้ — พิมพ์ "สร้างเกม" ก่อน` };
+      return env;
+    }
+    const s = settleGame(g);
+    env.players = g.players;
+    env.summary = {
+      ok: true,
+      holes_counted: s.holesCounted,
+      per_player: s.perPlayer,
+      message: statusMessage(g, store),
+    };
+    return env;
   }
 
   // "ดูพาร์" — a read, so it is answered even while the setup Q&A is open and
@@ -1199,7 +1303,7 @@ export function dispatch(text, sourceId, store) {
     ok: false,
     message:
       `พิมพ์ "สร้างเกม", "กรอกพาร์ 454354434 443535444", "เข้าร่วม แซม 105 90 91", ` +
-      `"หลุม 1 A 5 B 6" หรือ "ดูพาร์" เพื่อเช็กพาร์สนาม`,
+      `"หลุม 1 A 5 B 6", "สถานะ" หรือ "ดูพาร์"`,
   };
   return env;
 }
