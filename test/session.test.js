@@ -17,7 +17,7 @@ test("full group flow: create -> join -> course -> hole with net", () => {
   // create
   let out = dispatch("สร้างเกม 2 คน", G, store);
   assert.equal(out.action, "create_game");
-  assert.match(out.room_code, /^\d{4}$/);
+  assert.match(out.room_code, /^\d{9}$/); // DDMMYY + running no.
   assert.equal(out.summary.status, "waiting_players");
 
   // join A (no room code typed -> uses the group's active room)

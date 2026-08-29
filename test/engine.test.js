@@ -183,31 +183,46 @@ test("settleHoleHeadEatsTail: odd players -> middle รอด", () => {
   assert.equal(res.C, -20);
 });
 
-test("settleHoleHeadEatsTail: head group ties each other but not tail -> position-1 still wins", () => {
-  // sorted: A(2) B(2) C(2) D(2) E(4)
-  // Pair i=0: A(2) vs E(4): different -> fires, A wins
-  // Pair i=1: B(2) vs D(2): tied -> ชนตัดเจ๊า
-  // C: middle รอด
-  const res = settleHoleHeadEatsTail(
-    [{ name: "A", net: 2 }, { name: "B", net: 2 }, { name: "C", net: 2 }, { name: "D", net: 2 }, { name: "E", net: 4 }],
-    20
-  );
-  assert.equal(res.A, 20);
-  assert.equal(res.B, 0);
-  assert.equal(res.C, 0);
-  assert.equal(res.D, 0);
-  assert.equal(res.E, -20);
+test("settleHoleHeadEatsTail: a tied head voids the pairing (ชนตัดเจ๊า)", () => {
+  // A B C D all shoot 2, E shoots 4. Nobody has a unique best score, so no
+  // pairing fires. Previously the money went to whoever was TYPED first — the
+  // same hole paid A or B depending on the order the names were entered.
+  const rows = [
+    { name: "A", net: 2 }, { name: "B", net: 2 }, { name: "C", net: 2 },
+    { name: "D", net: 2 }, { name: "E", net: 4 },
+  ];
+  const res = settleHoleHeadEatsTail(rows, 20);
+  assert.deepEqual(res, { A: 0, B: 0, C: 0, D: 0, E: 0 });
 });
 
-test("settleHoleHeadEatsTail: give_up treated as worst score", () => {
-  // A(4) B(5) C=giveup: sorted A B C(Inf) -> A vs C: fires (4 != Inf)
+test("settleHoleHeadEatsTail does not depend on the order names were typed", () => {
+  // A(1) B(3) C(3) D(5): head and tail are both unique -> A eats D.
+  // The middle pair B/C ties -> ชนตัดเจ๊า, and that does not touch A vs D.
+  const rows = [
+    { name: "A", net: 1 }, { name: "B", net: 3 },
+    { name: "C", net: 3 }, { name: "D", net: 5 },
+  ];
+  const forwards = settleHoleHeadEatsTail(rows, 20);
+  const backwards = settleHoleHeadEatsTail([...rows].reverse(), 20);
+  assert.deepEqual(forwards, backwards);
+  assert.equal(forwards.A, 20);
+  assert.equal(forwards.D, -20);
+  assert.equal(forwards.B, 0);
+  assert.equal(forwards.C, 0);
+  assert.equal(Object.values(forwards).reduce((a, b) => a + b, 0), 0);
+});
+
+test("settleHoleHeadEatsTail: a player with no score sits the hole out", () => {
+  // "give up" no longer exists — a player with no net simply is not in the
+  // hole, so head-vs-tail runs between the two who did post a score.
   const res = settleHoleHeadEatsTail(
-    [{ name: "A", net: 4 }, { name: "B", net: 5 }, { name: "C", give_up: true }],
+    [{ name: "A", net: 4 }, { name: "B", net: 5 }, { name: "C" }],
     20
   );
   assert.equal(res.A, 20);
-  assert.equal(res.B, 0);
-  assert.equal(res.C, -20);
+  assert.equal(res.B, -20);
+  assert.equal(res.C ?? 0, 0);
+  assert.equal(Object.values(res).reduce((a, b) => a + b, 0), 0);
 });
 
 test("settleGame uses head_tail format when game.format set", () => {
@@ -315,7 +330,8 @@ test("strokesForHole reads the rules table by par", () => {
   assert.equal(strokesForHole(3, rules), 0);
   assert.equal(strokesForHole(4, rules), 1);
   assert.equal(strokesForHole(5, rules), 2);
-  assert.equal(strokesForHole(6, rules), 0); // unknown par -> 0
+  assert.equal(strokesForHole(6, rules), 2); // par 6 takes the par-5 allowance
+  assert.equal(strokesForHole(7, rules), 0); // genuinely unknown par -> 0
 });
 
 test("computeNet subtracts strokes", () => {
