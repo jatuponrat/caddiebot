@@ -35,6 +35,15 @@ async function ensurePool() {
         ssl: sslOff ? false : { rejectUnauthorized: false },
         max: 3,
       });
+      // A pooled connection dropped while IDLE (Supabase/pgBouncer reap them
+      // routinely, and any DB restart does it) emits 'error' on the pool. With
+      // no listener that is an unhandled 'error' event and Node kills the
+      // process, taking every live game with it. Log it and let the pool
+      // discard the client; the next query opens a fresh one.
+      pool.on("error", (e) => {
+        lastError = e?.message || String(e);
+        console.error("[db] idle client error (connection dropped):", lastError);
+      });
       return pool;
     })();
   }
@@ -195,6 +204,30 @@ export async function loadSession(sourceId) {
     return rows[0]?.state ?? null;
   } catch (e) {
     console.error("[db] loadSession error:", e.message);
+    return null;
+  }
+}
+
+/**
+ * Load ONE source's session even if its 12h window has elapsed.
+ *
+ * The caller needs the expired state, not just the knowledge that it expired:
+ * a round that ran out while the instance was asleep has to be ARCHIVED before
+ * its row is replaced by the group's next game. loadSession() hides those rows,
+ * so the round used to be overwritten and lost.
+ */
+export async function loadSessionAny(sourceId) {
+  const p = await ensurePool();
+  if (!p || !sourceId) return null;
+  try {
+    const { rows } = await p.query(
+      `SELECT state, expires_at FROM sessions WHERE source_id = $1`,
+      [sourceId]
+    );
+    if (!rows[0]) return null;
+    return { game: rows[0].state ?? null, expiresAt: rows[0].expires_at ?? null };
+  } catch (e) {
+    console.error("[db] loadSessionAny error:", e.message);
     return null;
   }
 }

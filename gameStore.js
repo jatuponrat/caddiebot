@@ -18,11 +18,12 @@ import {
   validateCourse,
   settleGame,
 } from "./engine.js";
+import { isValidHoleNumber } from "./parser.js";
 import {
   saveSession,
   deleteSession,
   loadActiveSessions,
-  loadSession,
+  loadSessionAny,
   saveRound,
   maxRoomSeqForDay,
   takeExpiredSessions,
@@ -43,6 +44,8 @@ export class GameStore {
     this.activeBySource = new Map(); // sourceId (groupId/userId) -> room_code
     this._writes = new Map(); // sourceId -> promise chain (serializes DB writes)
     this._seq = new Map(); // "160826" -> highest running number handed out that day
+    this._restores = new Map(); // sourceId -> in-flight restoreSource promise
+    this._awaitCount = new Map(); // sourceId -> deadline for "กี่คนครับ?" 
   }
 
   /**
@@ -194,9 +197,20 @@ export class GameStore {
    * Run at boot and on a timer from server.js.
    */
   async sweepExpired() {
-    const rows = await takeExpiredSessions().catch(() => []);
     let n = 0;
-    for (const row of rows) if (this._sweepRow(row)) n++;
+    // takeExpiredSessions() is capped (LIMIT 50). A single pass left the rest
+    // unarchived until the next timer 30 minutes later — and anything the group
+    // touched in between was lost. Keep going until the query comes back empty.
+    for (let pass = 0; pass < 200; pass++) {
+      const rows = await takeExpiredSessions().catch(() => []);
+      if (!rows.length) break;
+      let archivedThisPass = 0;
+      for (const row of rows) if (this._sweepRow(row)) archivedThisPass++;
+      n += archivedThisPass;
+      // Rows we deliberately skipped (a source that is live again) come back
+      // every pass; stop instead of spinning on them.
+      if (archivedThisPass === 0) break;
+    }
     return n;
   }
 
@@ -220,7 +234,17 @@ export class GameStore {
       return false;
     }
     const liveCode = sourceId ? this.activeBySource.get(sourceId) : null;
-    if (liveCode && liveCode !== game.room_code) return false; // superseded — hands off
+    if (liveCode && liveCode !== game.room_code) {
+      // The source is live again on a DIFFERENT room. We must not touch the new
+      // game's row or mapping — but the OLD round still deserves its history.
+      // (It used to be dropped on the assumption createGame had archived it;
+      // that only holds when the old game was in memory, which it is not after
+      // the instance sleeps — so a whole round vanished.) archive_key is the old
+      // room code, so this can never collide with the new round.
+      this.archiveGame({ ...game, source_id: game.source_id || sourceId }, "expired");
+      this.rooms.delete(game.room_code);
+      return true;
+    }
 
     this.archiveGame({ ...game, source_id: game.source_id || sourceId }, "expired");
     if (sourceId) this._persistDeleteExpired(sourceId);
@@ -257,8 +281,14 @@ export class GameStore {
    *  Expired games are dropped. Reading alone does NOT renew the TTL. */
   _resolve(room_code, sourceId) {
     let game = null;
-    if (room_code && this.rooms.has(room_code)) game = this.rooms.get(room_code);
-    else if (sourceId && this.activeBySource.has(sourceId)) {
+    if (room_code && this.rooms.has(room_code)) {
+      const candidate = this.rooms.get(room_code);
+      // A room belongs to the LINE source that created it. Typing another
+      // group's code used to add the player to THAT group's roster and then
+      // repoint this group at the other room, stranding its own round.
+      if (candidate?.source_id && sourceId && candidate.source_id !== sourceId) return null;
+      game = candidate;
+    } else if (sourceId && this.activeBySource.has(sourceId)) {
       game = this.rooms.get(this.activeBySource.get(sourceId)) || null;
     }
     if (this._expired(game)) {
@@ -274,10 +304,34 @@ export class GameStore {
   async restoreSource(sourceId) {
     if (!sourceId) return null;
     if (this.activeBySource.has(sourceId)) return this._resolve(null, sourceId);
-    const game = await loadSession(sourceId);
+    // Two LINE events for the same group arrive as separate concurrent requests.
+    // Without this, each one loaded its OWN copy of the game and the second
+    // _persist overwrote the first — a whole hole silently disappeared.
+    const inFlight = this._restores.get(sourceId);
+    if (inFlight) return inFlight;
+    const promise = this._restoreSourceOnce(sourceId).finally(() => {
+      if (this._restores.get(sourceId) === promise) this._restores.delete(sourceId);
+    });
+    this._restores.set(sourceId, promise);
+    return promise;
+  }
+
+  async _restoreSourceOnce(sourceId) {
+    if (this.activeBySource.has(sourceId)) return this._resolve(null, sourceId);
+    // Deliberately loads EXPIRED rows too — see below; loadSession() would hide
+    // exactly the round that still needs archiving.
+    const row = await loadSessionAny(sourceId);
+    const game = row?.game ?? null;
     if (!game?.room_code) return null;
-    if (this._expired(game)) {
-      this._persistDelete(sourceId);
+    const rowExpired = row.expiresAt ? new Date(row.expiresAt).getTime() <= Date.now() : false;
+    if (this._expired(game) || rowExpired) {
+      // The 12h window elapsed while the bot was asleep. This is the ONLY
+      // moment the round is in memory, so archive it here — deleting the row
+      // first (as this used to) meant the round was never written to history
+      // at all, which on a sleepy free instance is the normal case.
+      game.source_id = game.source_id || sourceId;
+      this.archiveGame(game, "expired");
+      this._persistDeleteExpired(sourceId);
       return null;
     }
     game.source_id = game.source_id || sourceId;
@@ -355,6 +409,27 @@ export class GameStore {
   pendingSetup(sourceId) {
     const game = this._resolve(null, sourceId);
     return game && game.setup && game.setup !== "done" ? game : null;
+  }
+
+  /** "สร้างเกม" with no player count: remember that the bot asked, so the
+   *  answer is not swallowed by the idle rule (there is no game yet). */
+  awaitPlayerCount(sourceId) {
+    if (!sourceId) return;
+    this._awaitCount.set(sourceId, Date.now() + 10 * 60 * 1000);
+  }
+
+  awaitingPlayerCount(sourceId) {
+    const until = sourceId ? this._awaitCount.get(sourceId) : null;
+    if (!until) return false;
+    if (Date.now() > until) {
+      this._awaitCount.delete(sourceId);
+      return false;
+    }
+    return true;
+  }
+
+  clearPlayerCountWait(sourceId) {
+    if (sourceId) this._awaitCount.delete(sourceId);
   }
 
   /** The active (non-expired) game for this source, or null. */
@@ -472,16 +547,36 @@ export class GameStore {
     const game = this._resolve(room_code, sourceId);
     if (!game) return { ok: false, error: "no active game" };
     const { valid, errors, course } = validateCourse(courseInput);
+    // Only a VALID card is stored. It used to be assigned before this check, so
+    // a card the bot rejected out loud ("ข้อมูลสนามไม่ครบ 18 หลุม") was still in
+    // play: its missing holes had no par, so they settled for nothing while
+    // still counting towards the round.
+    if (!valid) return { ok: false, errors, game };
     game.course = course;
     // Retroactively compute net for holes recorded before the course was set.
-    if (valid && game.rules) this._recomputeNets(game);
+    if (game.rules) this._recomputeNets(game);
     this._persist(game);
     return { ok: valid, errors, game };
   }
 
   join(sourceId, { room_code, player, scores }) {
     const game = this._resolve(room_code, sourceId);
-    if (!game) return { ok: false, error: "room_not_found" };
+    // A code that resolves to a DIFFERENT room than the one typed means the code
+    // does not exist — _resolve fell back to this source's active room. Joining
+    // that silently put the player in a room nobody asked for.
+    if (room_code && game && game.room_code !== room_code) {
+      return { ok: false, error: "room_not_found" };
+    }
+    if (!game) {
+      // Distinguish "no such room" from "that room is another group's".
+      if (room_code && this.rooms.has(room_code)) {
+        const other = this.rooms.get(room_code);
+        if (other?.source_id && other.source_id !== sourceId) {
+          return { ok: false, error: "room_other_source" };
+        }
+      }
+      return { ok: false, error: "room_not_found" };
+    }
     const cleanName = typeof player === "string" ? player.trim() : player;
     if (!cleanName || !Array.isArray(scores) || scores.length !== 3) {
       return { ok: false, error: "need_name_and_3_scores", game };
@@ -502,7 +597,7 @@ export class GameStore {
     if (sourceId) this.activeBySource.set(sourceId, game.room_code);
     this._recompute(game);
     this._persist(game);
-    return { ok: true, game, handicap_index: h.handicap_index };
+    return { ok: true, game, handicap_index: h.handicap_index, player_name: player_ };
   }
 
   /** Recompute diff, level, rules, receivers and status after a roster change. */
@@ -630,7 +725,16 @@ export class GameStore {
   recordHole(sourceId, { room_code, hole, players }) {
     const game = this._resolve(room_code, sourceId);
     if (!game) return { ok: false, error: "room_not_found" };
+    if (room_code && game.room_code !== room_code) {
+      return { ok: false, error: "room_not_found" }; // typed code does not exist
+    }
     if (hole == null) return { ok: false, error: "no_hole_number", game };
+    // Last line of defence: a round is 18 holes. Storing "หลุม 25" here is what
+    // made the settlement report "สรุปเงินรวม 19 หลุม" while the score itself
+    // silently went nowhere the group could see.
+    if (!isValidHoleNumber(hole)) {
+      return { ok: false, error: "bad_hole_number", hole: Number(hole), game };
+    }
 
     const par = game.course
       ? game.course.holes.find((h) => Number(h.hole) === Number(hole))?.par ?? null

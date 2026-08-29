@@ -8,7 +8,8 @@
     "start": "node server.js",
     "dev": "node --env-file=.env --watch server.js",
     "start:local": "node --env-file=.env server.js",
-    "test": "node --test"
+    "test": "node --test \"test/*.test.js\"",
+    "test:pg": "node --test \"test/*.pg.test.js\""
   },
   "engines": {
     "node": ">=18"

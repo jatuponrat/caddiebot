@@ -4,6 +4,7 @@
 // with a friendly Thai `summary.message` for the chat reply.
 
 import {
+  normalize,
   detectIntent,
   parseCreateGame,
   parseJoin,
@@ -11,8 +12,13 @@ import {
   parseParString,
   parseBulkScores,
   parseHistoryQuery,
+  parseStake,
+  parseFormat,
   lookupPresetCourse,
   MAX_HOLE_SCORE,
+  MIN_HOLE_NUMBER,
+  MAX_HOLE_NUMBER,
+  MIN_HOLE_SCORE,
 } from "./parser.js";
 import {
   settleHole,
@@ -24,6 +30,8 @@ import {
   formatRoomCodeDate,
   normalizeRoomCode,
   formatThaiDateTime,
+  matchPlayerName,
+  matrixForHole,
 } from "./engine.js";
 import { findCustomCourse, rememberCourse } from "./courseStore.js";
 import { findRound, listRounds } from "./db.js";
@@ -122,9 +130,66 @@ export function frontNineCard(game, store) {
 /** What the new back-nine handicaps would be: front-nine gross x 2. */
 export function back9Preview(game, store) {
   const front = store.frontNine(game);
+  // Never show a number for someone whose front nine has a gap: OUT x 2 off 8
+  // holes is simply too low, and quoting it made the bot advertise a handicap
+  // that "แต้มต่อใหม่" would then refuse to apply.
   return game.players
-    .map((p) => `${p.name} ${p.handicap_index} → ${front[p.name].total * 2}`)
+    .map((p) =>
+      front[p.name]?.complete
+        ? `${p.name} ${p.handicap_index} → ${front[p.name].total * 2}`
+        : `${p.name} ${p.handicap_index} → ยังไม่ครบ 9 หลุม`
+    )
     .join(" · ");
+}
+
+/**
+ * Resolve a name as typed on a score line against the roster.
+ *
+ * The line is tokenised greedily, so a stray word can end up glued to the front
+ * of a name ("หลุม 1 นะครับ แซม 5"). Try the whole thing first, then drop
+ * leading words one at a time — the trailing words are the name.
+ */
+export function resolveTypedName(registered, typed) {
+  const words = String(typed ?? "").trim().split(/\s+/).filter(Boolean);
+  let ambiguous = null;
+  for (let i = 0; i < words.length; i++) {
+    const m = matchPlayerName(registered, words.slice(i).join(" "));
+    if (m.ok) return m;
+    if (m.reason === "ambiguous" && !ambiguous) ambiguous = m;
+  }
+  return ambiguous || { ok: false, reason: "not_found", matches: [] };
+}
+
+/** The question the guided setup is currently waiting on. */
+export function setupQuestion(game) {
+  switch (game?.setup) {
+    case "course":
+      return "ต่อกันที่ตั้งค่าเกมนะครับ — สนามชื่ออะไรครับ? (พิมพ์ชื่อสนาม)";
+    case "await_pars":
+      return `กรอกพาร์ 18 หลุมของสนาม ${game.course_name || ""} ด้วยครับ เช่น "454354434 443535444"`;
+    case "confirm_course":
+      return 'ยืนยันพาร์สนามด้วยครับ (พิมพ์ ยืนยัน / แก้ไข)';
+    case "stake":
+      return "เล่นกันหลุมละเท่าไรครับ? (พิมพ์ตัวเลข เช่น 20)";
+    case "turbo":
+      return 'มีเทอร์โบไหมครับ? (พิมพ์ มี / ไม่มี)';
+    case "format":
+      return (
+        "กติกาการแพ้ชนะครับ?\n" +
+        "1️⃣ หัวกินหาง (อันดับ 1 ชนะอันดับสุดท้าย)\n" +
+        "2️⃣ กินกันทุกคน (ทุกคู่เปรียบสกอร์)"
+      );
+    default:
+      return "";
+  }
+}
+
+/** Who still has a missing score in holes 1-9. */
+export function frontNineMissing(game, store) {
+  const front = store.frontNine(game);
+  return Object.entries(front)
+    .filter(([, v]) => !v.complete)
+    .map(([n]) => n);
 }
 
 /**
@@ -286,12 +351,24 @@ export function dispatch(text, sourceId, store) {
   // source, Caddiebot ignores EVERYTHING except "สร้างเกม" / "สร้างเกมส์",
   // which starts a completely fresh game.
   const _og = store.activeGame(sourceId);
-  if (!_og && intent !== "create_game") return idleEnvelope();
+  if (!_og && intent !== "create_game") {
+    // "สร้างเกม" with no number asks "กี่คนครับ?" — the answer arrives with no
+    // game in existence, so without this it hit the idle rule and got silence.
+    const wanted = store.awaitingPlayerCount?.(sourceId);
+    const answer = wanted ? Number((String(raw).match(/\d{1,2}/) || [])[0]) : NaN;
+    if (wanted && Number.isFinite(answer) && answer >= 1 && answer <= 20) {
+      return dispatch(`สร้างเกม ${answer} คน`, sourceId, store);
+    }
+    return idleEnvelope();
+  }
 
   // Pending hole-override confirmation (ยืนยัน/ยกเลิก after re-submitting a complete hole)
   if (_og?.pending_override) {
     const trimmed = raw.trim();
-    if (/^(ยืนยัน|ใช่|yes|^y)$/i.test(trimmed)) {
+    // No \b here: Thai letters are not word characters, so a boundary anchor
+    // never matches after "ยืนยัน" and "ยืนยันครับ" fell through to the generic
+    // help text while the edit stayed armed.
+    if (/^(ยืนยัน|ตกลง|โอเค|ใช่)/.test(trimmed) || /^(ok|okay|yes|y)$/i.test(trimmed)) {
       const { hole, players } = _og.pending_override;
       _og.pending_override = null;
       store.save(_og);
@@ -307,7 +384,11 @@ export function dispatch(text, sourceId, store) {
       let moneyLine = "";
       if (netComputed && r.game.stake) {
         const settleFn = r.game.format === "head_tail" ? settleHoleHeadEatsTail : settleHole;
-        const ctx = r.game.stroke_matrix ? { par: r.par, matrix: r.game.stroke_matrix } : null;
+        // matrixForHole, not stroke_matrix: after a back-nine re-handicap the
+        // front nine settles on the FROZEN matrix. Reading the live one made the
+        // bot report a different number than the books for an edited hole 1-9.
+        const frozen = matrixForHole(r.game, hole);
+        const ctx = frozen ? { par: r.par, matrix: frozen } : null;
         holeMoney = settleFn(rows, stakeHole, ctx);
         moneyLine = `\n💰 หลุมนี้ (หลุมละ ${stakeHole}): ${fmtMoney(holeMoney)}`;
       }
@@ -318,7 +399,7 @@ export function dispatch(text, sourceId, store) {
       };
       return env;
     }
-    if (/^(ยกเลิก|ไม่|no|^n)$/i.test(trimmed)) {
+    if (/^(ยกเลิก|ไม่)/.test(trimmed) || /^(no|n)$/i.test(trimmed)) {
       _og.pending_override = null;
       store.save(_og);
       const env = emptyEnvelope();
@@ -326,7 +407,13 @@ export function dispatch(text, sourceId, store) {
       env.summary = { ok: false, message: "ยกเลิกแล้ว — สกอร์เดิมยังคงอยู่" };
       return env;
     }
-    // not a yes/no — fall through (pending_override stays until answered)
+    // Not a yes/no. A pending edit used to sit armed indefinitely: play carried
+    // on and a "ยืนยัน" typed five holes later silently rewrote the old hole.
+    // Anything that is real gameplay cancels it instead.
+    if (intent === "hole_scores" || intent === "bulk_scores" || intent === "settle" || intent === "end_game") {
+      _og.pending_override = null;
+      store.save(_og);
+    }
   }
 
   // "ตกลง" straight after the handicap table -> jump back to the hole in play.
@@ -356,28 +443,124 @@ export function dispatch(text, sourceId, store) {
   // Guided setup: while a game is mid-setup, free-text replies are the answers.
   const pending = store.pendingSetup(sourceId);
   // While mid-setup, answers (incl. "ชื่อ + พาร์" which looks like bulk/par) go to setup.
+  // A bulk card naming someone already on the roster is a score card, not an
+  // answer — routing it into the setup Q&A silently ate a player's whole round.
+  const bulkFromKnownPlayer =
+    pending &&
+    intent === "bulk_scores" &&
+    (() => {
+      const b = parseBulkScores(raw);
+      if (!b.ok) return false;
+      const roster = (pending.players || []).map((x) => x.name).filter(Boolean);
+      return roster.length > 0 && resolveTypedName(roster, b.name).ok;
+    })();
+
   if (
     pending &&
-    (intent === "unknown" || intent === "bulk_scores" || intent === "par_string")
+    !bulkFromKnownPlayer &&
+    (intent === "unknown" ||
+      intent === "bulk_scores" ||
+      intent === "par_string" ||
+      // While the Q&A is open these ARE the answers to it.
+      intent === "set_stake" ||
+      intent === "set_format")
   ) {
     return handleSetupAnswer(raw, sourceId, store, pending);
   }
-  // Real gameplay (join/score) — end any leftover setup so later chat isn't captured.
-  if (pending && (intent === "join" || intent === "hole_scores")) {
+  // Real gameplay (join / score) closes the guided Q&A — the group has clearly
+  // moved on. It used to close SILENTLY, so stake and pars stayed null, the bot
+  // never asked again, and the round ended with "ทุกคน 0" presented as a real
+  // settlement. Now whatever is still unset is named out loud, and it can be
+  // set at any time afterwards ("หลุมละ 20", "กติกา หัวกินหาง").
+  let setupClosingNote = "";
+  if (pending && (intent === "join" || intent === "hole_scores" || bulkFromKnownPlayer)) {
+    const missing = [];
+    if (!pending.course) missing.push('พาร์สนาม — พิมพ์ "454354434 443535444"');
+    if (pending.stake == null) missing.push('เงินเดิมพัน — พิมพ์ "หลุมละ 20"');
+    if (pending.turbo == null) store.setTurbo(sourceId, false);
+    if (!pending.format) store.setFormat(sourceId, "all_vs_all");
     store.finishSetup(sourceId);
+    if (missing.length) {
+      setupClosingNote =
+        `\n\n⚠️ ยังไม่ได้ตั้ง: ${missing.join(" · ")}\n` +
+        `ตั้งเมื่อไรก็ได้ครับ — ถ้าไม่ตั้งเงินเดิมพัน รอบนี้จะไม่คิดเงิน`;
+    }
+  }
+
+  // Set the stake / rules after setup has closed. Both change how EVERY hole
+  // settles, so they are refused once scores exist rather than silently
+  // rewriting money the group has already been told.
+  if (intent === "set_stake" || intent === "set_format") {
+    const g = store.activeGame(sourceId);
+    const env = emptyEnvelope();
+    env.action = intent;
+    if (!g) {
+      env.summary = { ok: false, message: `ยังไม่มีเกมในกลุ่มนี้ — พิมพ์ "สร้างเกม" ก่อน` };
+      return env;
+    }
+    const played = Object.keys(g.holes || {}).length;
+    if (played > 0) {
+      env.summary = {
+        ok: false,
+        message:
+          `ลงสกอร์ไปแล้ว ${played} หลุม — เปลี่ยน${intent === "set_stake" ? "เงินเดิมพัน" : "กติกา"}ตอนนี้จะทำให้เงินหลุมที่ผ่านมาเปลี่ยนตามครับ\n` +
+          `ถ้าต้องการจริง ๆ ให้ "จบเกม" แล้วสร้างเกมใหม่`,
+      };
+      return env;
+    }
+    // store.setStake / setFormat also drive the guided Q&A forward. When the
+    // setup is already finished they must not re-open it, or the group's next
+    // message gets swallowed as an answer to a question nobody asked.
+    const wasDone = g.setup === "done";
+    const keepSetupState = () => {
+      if (wasDone && g.setup !== "done") {
+        g.setup = "done";
+        store.save(g);
+      }
+    };
+    if (intent === "set_stake") {
+      const amount = parseStake(raw);
+      if (!amount || amount < 0) {
+        env.summary = { ok: false, message: 'พิมพ์เป็นตัวเลขครับ เช่น "หลุมละ 20"' };
+        return env;
+      }
+      store.setStake(sourceId, amount);
+      keepSetupState();
+      env.summary = { ok: true, stake: amount, message: `หลุมละ ${amount} ✅` };
+      return env;
+    }
+    const format = parseFormat(raw);
+    if (!format) {
+      env.summary = { ok: false, message: 'พิมพ์ "กติกา หัวกินหาง" หรือ "กติกา กินกันทุกคน" ครับ' };
+      return env;
+    }
+    store.setFormat(sourceId, format);
+    keepSetupState();
+    env.summary = {
+      ok: true,
+      format,
+      message: `กติกา: ${format === "head_tail" ? "หัวกินหาง" : "กินกันทุกคน"} ✅`,
+    };
+    return env;
   }
 
   if (intent === "create_game") {
     const { expected_players } = parseCreateGame(text);
     if (!expected_players) {
+      // No game exists yet, so the idle rule would swallow the group's natural
+      // answer ("4 คน") and the bot would go completely silent. Remember that we
+      // asked, and treat the next number as the answer (see the check above).
+      store.awaitPlayerCount?.(sourceId);
       const env = emptyEnvelope();
       env.action = "create_game";
       env.summary = {
         ok: false,
-        message: `ระบุจำนวนผู้เล่นด้วยครับ เช่น "สร้างเกม 4 คน"`,
+        awaiting: "player_count",
+        message: `กี่คนครับ? (พิมพ์ตัวเลข เช่น "4 คน")`,
       };
       return env;
     }
+    store.clearPlayerCountWait?.(sourceId);
     const game = store.createGame(sourceId, { expected_players });
     const env = emptyEnvelope();
     env.action = "create_game";
@@ -405,9 +588,11 @@ export function dispatch(text, sourceId, store) {
     const names = g.players.map((p) => p.name).join(", ") || "—";
     const holesPlayed = Object.keys(g.holes).length;
     const s = settleGame(g);
-    const settleLine = s.holesCounted
-      ? `\n💰 สรุปเงิน (${s.holesCounted} หลุม): ${fmtMoney(s.perPlayer)}\n(บวก = ได้ / ลบ = จ่าย)`
-      : "\n(ยังไม่มีสกอร์ที่บันทึก)";
+    const settleLine = !s.holesCounted
+      ? "\n(ยังไม่มีสกอร์ที่บันทึก)"
+      : !g.stake
+        ? "\n(รอบนี้ไม่ได้ตั้งเงินเดิมพัน จึงไม่มีเงินให้สรุป)"
+        : `\n💰 สรุปเงิน: ${fmtMoney(s.perPlayer)}\n(บวก = ได้ / ลบ = จ่าย)`;
     env.players = g.players;
     env.summary = {
       ok: true,
@@ -418,7 +603,7 @@ export function dispatch(text, sourceId, store) {
       per_player: s.perPlayer,
       message:
         `จบเกมแล้ว ✅\n` +
-        `สนาม ${g.course_name || "-"} · ผู้เล่น: ${names} · ${holesPlayed}/18 หลุม` +
+        `สนาม ${g.course_name || "-"} · ผู้เล่น: ${names} · เล่นไปแล้ว ${holesPlayed}/18 หลุม` +
         settleLine +
         `\n📒 ห้อง ${g.room_code} — ดูย้อนหลังได้ด้วย "ประวัติ ${g.room_code}"`,
     };
@@ -451,6 +636,22 @@ export function dispatch(text, sourceId, store) {
 
   if (intent === "join") {
     const parsed = parseJoin(text);
+    const env0 = emptyEnvelope();
+    // More than 3 numbers: which three are "the last 3 rounds" is a guess, and
+    // guessing changes the handicap. Ask instead of silently dropping one.
+    if (parsed.extra_scores && parsed.extra_scores.length > 0) {
+      env0.action = "join";
+      env0.room_code = parsed.room_code || null;
+      env0.summary = {
+        ok: false,
+        message:
+          `ใส่สกอร์ 3 รอบล่าสุดเท่านั้นครับ — ได้รับ ` +
+          `${parsed.scores.concat(parsed.extra_scores).length} ตัว ` +
+          `(${parsed.scores.concat(parsed.extra_scores).join(", ")})\n` +
+          `เช่น "เข้าร่วม ${parsed.player || "แซม"} ${parsed.scores.join(" ")}"`,
+      };
+      return env0;
+    }
     const r = store.join(sourceId, parsed);
     const env = emptyEnvelope();
     env.action = "join";
@@ -460,9 +661,12 @@ export function dispatch(text, sourceId, store) {
       env.summary = {
         ok: false,
         message:
-          r.error === "room_not_found"
-            ? `ไม่พบห้อง — พิมพ์ "สร้างเกม" ก่อน หรือใส่รหัสห้องให้ถูกต้อง`
-            : `ต้องมีชื่อและสกอร์ 3 รอบ เช่น "เข้าร่วม แซม 105 90 91"`,
+          r.error === "room_other_source"
+            ? `รหัสห้อง ${parsed.room_code} เป็นของกลุ่มอื่นครับ — เข้าร่วมไม่ได้\n` +
+              `ถ้าจะเล่นในกลุ่มนี้ พิมพ์ "สร้างเกม" หรือ "เข้าร่วม [ชื่อ] [สกอร์ 3 รอบ]" โดยไม่ต้องใส่รหัส`
+            : r.error === "room_not_found"
+              ? `ไม่พบห้อง — พิมพ์ "สร้างเกม" ก่อน หรือใส่รหัสห้องให้ถูกต้อง`
+              : `ต้องมีชื่อและสกอร์ 3 รอบ เช่น "เข้าร่วม แซม 105 90 91"`,
       };
       return env;
     }
@@ -472,15 +676,18 @@ export function dispatch(text, sourceId, store) {
     env.rules = g.rules;
     const count = g.players.length;
     const cap = g.expected_players ? `/${g.expected_players}` : "";
+    const stillSettingUp = store.pendingSetup(sourceId);
     env.summary = {
       ok: true,
-      player: parsed.player,
+      player: r.player_name || parsed.player,
       handicap_index: r.handicap_index,
       status: g.status,
+      setup_pending: stillSettingUp ? stillSettingUp.setup : null,
       message:
-        `${parsed.player} เข้าร่วมแล้ว (แต้มต่อ ${r.handicap_index}) ` +
+        `${r.player_name || parsed.player} เข้าร่วมแล้ว (แต้มต่อ ${r.handicap_index}) ` +
         `— ผู้เล่น ${count}${cap} คน` +
-        maybeStartRound(g, store),
+        (stillSettingUp ? `\n\n${setupQuestion(stillSettingUp)}` : maybeStartRound(g, store)) +
+        setupClosingNote,
     };
     return env;
   }
@@ -490,6 +697,20 @@ export function dispatch(text, sourceId, store) {
     const env = emptyEnvelope();
     env.action = "hole_scores";
     env.hole = parsed.hole;
+
+    // Hole number outside 1-18. This used to be accepted and stored, so the
+    // score vanished from the round while still inflating "สรุปเงินรวม X หลุม".
+    if (parsed.hole_invalid != null) {
+      env.summary = {
+        ok: false,
+        hole_invalid: parsed.hole_invalid,
+        message:
+          `หลุมต้องอยู่ระหว่าง ${MIN_HOLE_NUMBER}–${MAX_HOLE_NUMBER} ` +
+          `(ได้รับ "หลุม ${parsed.hole_invalid}") — ยังไม่ได้บันทึกนะครับ\n` +
+          `เช่น "หลุม 12 แซม 5"`,
+      };
+      return env;
+    }
 
     // If no players could be parsed at all, reject immediately.
     if (!parsed.players || parsed.players.length === 0) {
@@ -524,10 +745,40 @@ export function dispatch(text, sourceId, store) {
     const activeGame = store.activeGame(sourceId);
     if (activeGame && parsed.players && parsed.players.length > 0) {
       const registered = activeGame.players.map((p) => p.name).filter(Boolean);
+      if (registered.length === 0) {
+        // Nothing to check a name against yet. Recording the row anyway (as this
+        // used to) put a non-player on the card, and settlement then dropped
+        // that row's money — the round stopped summing to zero.
+        env.summary = {
+          ok: false,
+          message:
+            `ยังไม่มีผู้เล่นในห้องนี้ — พิมพ์ "เข้าร่วม [ชื่อ] [สกอร์ 3 รอบ]" ก่อนนะครับ\n` +
+            `เช่น "เข้าร่วม แซม 105 90 91"`,
+        };
+        return env;
+      }
       if (registered.length > 0) {
-        const unknown = parsed.players
-          .map((p) => p.name)
-          .filter((n) => n && !registered.includes(n));
+        // A score line is parsed one word at a time, so "สมชาย" has to be able
+        // to reach a player registered as "สมชาย ใจดี". matchPlayerName only
+        // resolves an UNAMBIGUOUS match; anything else is reported, not guessed.
+        const unknown = [];
+        const ambiguous = [];
+        for (const p of parsed.players) {
+          if (!p.name) continue;
+          const m = resolveTypedName(registered, p.name);
+          if (m.ok) p.name = m.name; // canonicalise before anything is stored
+          else if (m.reason === "ambiguous") ambiguous.push(`${p.name} → ${m.matches.join(" / ")}`);
+          else unknown.push(p.name);
+        }
+        if (ambiguous.length > 0) {
+          env.summary = {
+            ok: false,
+            message:
+              `ชื่อ "${ambiguous.join(", ")}" ตรงกับผู้เล่นมากกว่า 1 คน — พิมพ์ให้ชัดกว่านี้ครับ\n` +
+              `(ชื่อที่ลงทะเบียน: ${registered.join(", ")})`,
+          };
+          return env;
+        }
         if (unknown.length > 0) {
           env.summary = {
             ok: false,
@@ -565,7 +816,9 @@ export function dispatch(text, sourceId, store) {
         message:
           r.error === "room_not_found"
             ? `ยังไม่มีเกมในกลุ่มนี้ — พิมพ์ "สร้างเกม" ก่อน`
-            : `อ่านหมายเลขหลุมไม่ได้ เช่น "หลุม 1 A 5 B 6"`,
+            : r.error === "bad_hole_number"
+              ? `หลุมต้องอยู่ระหว่าง ${MIN_HOLE_NUMBER}–${MAX_HOLE_NUMBER} (ได้รับ "หลุม ${r.hole}") — ยังไม่ได้บันทึกนะครับ`
+              : `อ่านหมายเลขหลุมไม่ได้ เช่น "หลุม 1 A 5 B 6"`,
       };
       return env;
     }
@@ -586,9 +839,11 @@ export function dispatch(text, sourceId, store) {
         hole,
         complete: false,
         message:
+          setupClosingNote.trim() +
+          (setupClosingNote ? "\n\n" : "") +
           `รับหลุม ${hole}: ${got || "-"} ✅` +
           (registered.length ? ` (รออีก: ${waiting.join(", ")})` : "") +
-          (cappedNote ? `\n⚠️ ปรับเป็นสูงสุด ${MAX_HOLE_SCORE}: ${cappedNote}` : ""),
+          (cappedNote ? `\n⚠️ ปรับให้อยู่ในช่วง ${MIN_HOLE_SCORE}–${MAX_HOLE_SCORE}: ${cappedNote}` : ""),
       };
       return env;
     }
@@ -602,7 +857,8 @@ export function dispatch(text, sourceId, store) {
     let moneyLine = "";
     if (netComputed && game.stake) {
       const settleFn = game.format === "head_tail" ? settleHoleHeadEatsTail : settleHole;
-      const ctx = game.stroke_matrix ? { par: r.par, matrix: game.stroke_matrix } : null;
+      const holeMatrix = matrixForHole(game, hole);
+      const ctx = holeMatrix ? { par: r.par, matrix: holeMatrix } : null;
       holeMoney = settleFn(rows, stakeHole, ctx);
       moneyLine = `\n💰 หลุมนี้ (หลุมละ ${stakeHole}): ${fmtMoney(holeMoney)}`;
     }
@@ -630,12 +886,22 @@ export function dispatch(text, sourceId, store) {
       // Offer fresh handicaps for the back nine while everyone is looking at
       // the front-nine numbers — this is the only moment the offer makes sense.
       if (!game.back9_handicap && game.players.length >= 2) {
-        game.awaiting_back9_handicap = true;
-        store.save(game);
-        turnLine +=
-          `\n\n🔁 9 หลุมหลังจะใช้แต้มต่อใหม่ไหมครับ?` +
-          `\n(คิดจากสกอร์ 9 หลุมแรก ×2 — ${back9Preview(game, store)})` +
-          `\nพิมพ์ "แต้มต่อใหม่" เพื่อเปลี่ยน · "แต้มต่อเดิม" เพื่อใช้ของเดิม`;
+        const missingFront = frontNineMissing(game, store);
+        if (missingFront.length > 0) {
+          // Offering the swap here would be a lie: applyBack9Handicap refuses
+          // an incomplete front nine, so say what is missing instead.
+          turnLine +=
+            `\n\n🔁 ยังเปลี่ยนแต้มต่อสำหรับ 9 หลุมหลังไม่ได้ — ` +
+            `สกอร์ 9 หลุมแรกยังไม่ครบ (ขาด: ${missingFront.join(", ")})` +
+            `\nลงให้ครบแล้วพิมพ์ "แต้มต่อใหม่" ได้เลยครับ`;
+        } else {
+          game.awaiting_back9_handicap = true;
+          store.save(game);
+          turnLine +=
+            `\n\n🔁 9 หลุมหลังจะใช้แต้มต่อใหม่ไหมครับ?` +
+            `\n(คิดจากสกอร์ 9 หลุมแรก ×2 — ${back9Preview(game, store)})` +
+            `\nพิมพ์ "แต้มต่อใหม่" เพื่อเปลี่ยน · "แต้มต่อเดิม" เพื่อใช้ของเดิม`;
+        }
       }
     }
     env.summary = {
@@ -649,8 +915,10 @@ export function dispatch(text, sourceId, store) {
       money: holeMoney,
       turn_summary: Boolean(turnLine),
       message:
+        setupClosingNote.trim() +
+        (setupClosingNote ? "\n\n" : "") +
         `หลุม ${hole} ครบทุกคน ✅${turboTag}` +
-        (cappedNote ? `\n⚠️ ปรับเป็นสูงสุด ${MAX_HOLE_SCORE}: ${cappedNote}` : "") +
+        (cappedNote ? `\n⚠️ ปรับให้อยู่ในช่วง ${MIN_HOLE_SCORE}–${MAX_HOLE_SCORE}: ${cappedNote}` : "") +
         `${moneyLine}${turnLine}` +
         (turnLine ? `\n${nextLine}` : nextLine),
     };
@@ -769,10 +1037,17 @@ export function dispatch(text, sourceId, store) {
       ok: true,
       holes_counted: s.holesCounted,
       per_player: s.perPlayer,
-      message: s.holesCounted
-        ? `สรุปเงินรวม ${s.holesCounted} หลุม 💰\n${fmtMoney(s.perPlayer)}\n(บวก = ได้ / ลบ = จ่าย)\n` +
-          `📒 ห้อง ${g.room_code} — ดูย้อนหลังได้ด้วย "ประวัติ ${g.room_code}"`
-        : "ยังไม่มีสกอร์ที่บันทึก — ลงแต้มก่อนนะครับ",
+      message: !s.holesCounted
+        ? "ยังไม่มีสกอร์ที่บันทึก — ลงแต้มก่อนนะครับ"
+        : !g.stake
+          ? // Printing "ทุกคน 0" as a settlement made a round with no stake look
+            // like everyone had broken even. Say what actually happened.
+            `รอบนี้ไม่ได้ตั้งเงินเดิมพัน จึงไม่มีเงินให้สรุปครับ ` +
+            `(เล่นไปแล้ว ${s.holesCounted}/18 หลุม)\n` +
+            `ตั้งก่อนออกรอบครั้งหน้าด้วย "หลุมละ 20"\n` +
+            `📒 ห้อง ${g.room_code} — ดูสกอร์ย้อนหลังได้ด้วย "ประวัติ ${g.room_code}"`
+          : `สรุปเงินรวม 💰 (เล่นไปแล้ว ${s.holesCounted}/18 หลุม)\n${fmtMoney(s.perPlayer)}\n(บวก = ได้ / ลบ = จ่าย)\n` +
+            `📒 ห้อง ${g.room_code} — ดูย้อนหลังได้ด้วย "ประวัติ ${g.room_code}"`,
     };
     return env;
   }
@@ -791,15 +1066,34 @@ export function dispatch(text, sourceId, store) {
       };
       return env;
     }
-    const r = store.recordBulk(sourceId, parsed.name, parsed.scores);
+    // Same one-word-name problem as the per-hole path: resolve to the roster
+    // so a bulk card can never open a phantom second player.
+    let bulkName = parsed.name;
+    const bulkGame = store.activeGame(sourceId);
+    const bulkRoster = (bulkGame?.players || []).map((p) => p.name).filter(Boolean);
+    if (bulkRoster.length > 0) {
+      const m = resolveTypedName(bulkRoster, bulkName);
+      if (m.ok) bulkName = m.name;
+      else {
+        env.summary = {
+          ok: false,
+          message:
+            (m.reason === "ambiguous"
+              ? `ชื่อ "${bulkName}" ตรงกับผู้เล่นมากกว่า 1 คน (${m.matches.join(" / ")})`
+              : `ไม่พบชื่อ "${bulkName}"`) + `\n(ชื่อที่ลงทะเบียน: ${bulkRoster.join(", ")})`,
+        };
+        return env;
+      }
+    }
+    const r = store.recordBulk(sourceId, bulkName, parsed.scores);
     if (!r.ok) {
       env.summary = { ok: false, message: `ยังไม่มีเกมในกลุ่มนี้ — พิมพ์ "สร้างเกม" ก่อน` };
       return env;
     }
     env.summary = {
       ok: true,
-      player: parsed.name,
-      message: `รับสกอร์ ${parsed.name} ครบ 18 หลุมแล้ว ✅\nครบทุกคนแล้วพิมพ์ "รวม 18" เพื่อสรุปเงิน`,
+      player: bulkName,
+      message: `รับสกอร์ ${bulkName} ครบ 18 หลุมแล้ว ✅\nครบทุกคนแล้วพิมพ์ "รวม 18" เพื่อสรุปเงิน`,
     };
     return env;
   }
@@ -829,6 +1123,15 @@ export function dispatch(text, sourceId, store) {
     env.course = set.game?.course ?? null;
     env.handicap_level = set.game?.handicap_level ?? null;
     const note = r.total < 69 || r.total > 74 ? " (ปกติ 70–72 ลองเช็กอีกครั้ง)" : "";
+    // If the guided setup was waiting for the course, this answered it — move on
+    // to the next question instead of leaving the Q&A stuck on "สนามชื่ออะไร".
+    let nextQuestion = "";
+    if (set.game && ["course", "await_pars", "confirm_course"].includes(set.game.setup)) {
+      set.game.setup = set.game.stake == null ? "stake" : set.game.turbo == null ? "turbo" : "format";
+      set.game.pending_course = null;
+      store.save(set.game);
+      nextQuestion = `\n${setupQuestion(set.game)}`;
+    }
     env.summary = {
       ok: true,
       total_par: r.total,
@@ -836,7 +1139,7 @@ export function dispatch(text, sourceId, store) {
       in: r.in,
       message:
         `กรอกพาร์ ${r.total} สำเร็จแล้ว ✅ (OUT ${r.out} / IN ${r.in})${note}` +
-        maybeStartRound(set.game, store),
+        (nextQuestion || maybeStartRound(set.game, store)),
     };
     return env;
   }
@@ -855,7 +1158,9 @@ export function dispatch(text, sourceId, store) {
 function handleSetupAnswer(text, sourceId, store, game) {
   const env = emptyEnvelope();
   env.action = "game_setup";
-  const t = String(text).trim();
+  // normalize(): Thai digits -> Arabic and whitespace collapsed. Without it the
+  // setup Q&A was the one place "๑๐๐" did not work.
+  const t = normalize(text);
 
   if (game.setup === "course") {
     // (a) "ชื่อ + พาร์ 18 หลุม" เช่น "Kbsc 454435434 435444354"
@@ -892,6 +1197,14 @@ function handleSetupAnswer(text, sourceId, store, game) {
       return env;
     }
     // (c) ชื่อเฉย ๆ -> สนามสำเร็จรูป/คลัง (โหลดเลย) หรือ ไม่พบ -> ขอกรอกพาร์เอง
+    if (!t || !/[A-Za-z฀-๿0-9]/.test(t)) {
+      env.summary = {
+        ok: false,
+        step: "course",
+        message: `สนามชื่ออะไรครับ? (พิมพ์ชื่อสนาม เช่น "เดอะไพน์")`,
+      };
+      return env;
+    }
     const found = lookupPresetCourse(t) || findCustomCourse(t);
     if (found && found.ok) {
       const r = store.setCourseName(sourceId, t);
@@ -971,12 +1284,13 @@ function handleSetupAnswer(text, sourceId, store, game) {
   }
 
   if (game.setup === "stake") {
-    const num = (t.match(/\d+/) || [])[0];
-    if (!num) {
+    // "หลุมละ 1,000 บาท" must be 1000, not 1 — the first \d+ used to win.
+    const amount = parseStake(t);
+    if (!amount || amount < 0) {
       env.summary = { ok: false, step: "stake", message: "พิมพ์เป็นตัวเลขครับ เช่น 20 (หลุมละกี่บาท)" };
       return env;
     }
-    const r = store.setStake(sourceId, Number(num));
+    const r = store.setStake(sourceId, amount);
     env.summary = {
       ok: true,
       step: "turbo",
@@ -1113,7 +1427,7 @@ function formatRoundDetail(row) {
     : "";
 
   const moneyLine = Object.keys(settlement).length
-    ? `\n💰 สรุปเงิน (${row.holes_counted ?? "-"} หลุม)\n${fmtMoney(settlement)}\n(บวก = ได้ / ลบ = จ่าย)`
+    ? `\n💰 สรุปเงิน (เล่นไปแล้ว ${row.holes_counted ?? "-"}/18 หลุม)\n${fmtMoney(settlement)}\n(บวก = ได้ / ลบ = จ่าย)`
     : "\n(รอบนี้ไม่มีสกอร์ที่บันทึกไว้)";
 
   const cardLines = Object.entries(totals)
@@ -1138,7 +1452,7 @@ function formatRoundList(rows) {
     const code = r.archive_key || r.room_code;
     const when = formatRoomCodeDate(code) || fmtWhen(r.created_at);
     const money = Object.keys(r.settlement || {}).length ? fmtMoney(r.settlement) : "—";
-    return `${i + 1}. ${code} · ${when} · ${r.course_name || "-"} · ${r.holes_counted ?? "-"} หลุม\n   ${money}`;
+    return `${i + 1}. ${code} · ${when} · ${r.course_name || "-"} · ${r.holes_counted ?? "-"}/18 หลุม\n   ${money}`;
   });
   return (
     `📒 ${rows.length} รอบล่าสุดของกลุ่มนี้\n\n${lines.join("\n")}\n\n` +

@@ -23,6 +23,20 @@ const ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN || "";
 const store = new GameStore(); // in-memory; swap for DB/backend in production
 const app = express();
 
+// Last-resort nets. A single bad request or a dropped DB socket must never be
+// able to take the bot down silently.
+//  - a stray rejection is logged and the process keeps serving;
+//  - a truly uncaught exception leaves the process in an unknown state, so we
+//    exit and let the host restart us — live sessions are in Postgres and are
+//    reloaded on boot, so a restart costs a few seconds, not a round.
+process.on("unhandledRejection", (err) => {
+  console.error("[caddiebot] unhandled rejection (ignored):", err);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[caddiebot] uncaught exception — exiting for a clean restart:", err);
+  process.exit(1);
+});
+
 app.use(
   express.json({
     verify: (req, _res, buf) => {
@@ -83,6 +97,18 @@ function sourceIdOf(source = {}) {
 }
 
 app.post("/webhook", async (req, res) => {
+  try {
+    await handleWebhook(req, res);
+  } catch (err) {
+    // Express 4 does not catch async rejections: without this the process dies
+    // and every in-memory game dies with it. A malformed POST must cost one
+    // 400, not the whole bot.
+    console.error("[caddiebot] webhook error:", err);
+    if (!res.headersSent) res.status(400).json({ ok: false, error: "bad request" });
+  }
+});
+
+async function handleWebhook(req, res) {
   const signature = req.get("x-line-signature");
   if (CHANNEL_SECRET) {
     if (!verifySignature(req.rawBody, signature, CHANNEL_SECRET)) {
@@ -102,7 +128,7 @@ app.post("/webhook", async (req, res) => {
       console.error("[caddiebot] event error:", err);
     }
   }
-});
+}
 
 // --- startup / state restore ------------------------------------------------
 // The DB restore MUST finish before we answer webhooks. Previously it ran inside
@@ -241,6 +267,17 @@ function startKeepAlive() {
   }, every).unref?.();
   console.log(`[caddiebot] keep-alive pinging ${url}/health every ${Math.round(every / 60000)}m`);
 }
+
+// Anything that slips past a route (malformed JSON, an oversized body) answers
+// as JSON instead of Express's default HTML page, which leaks a stack trace.
+app.use((err, _req, res, _next) => {
+  console.error("[caddiebot] request error:", err?.message || err);
+  if (res.headersSent) return;
+  res.status(err?.status && err.status < 500 ? err.status : 400).json({
+    ok: false,
+    error: "bad request",
+  });
+});
 
 const isMain = process.argv[1] && import.meta.url === `file://${process.argv[1]}`;
 if (isMain) {

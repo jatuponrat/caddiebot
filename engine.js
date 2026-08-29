@@ -156,6 +156,45 @@ export function formatRoomCodeDate(input) {
 }
 
 /**
+ * Resolve a name typed on a score line to a registered roster name.
+ *
+ * Per-hole score lines are parsed one word at a time, so a player registered as
+ * "สมชาย ใจดี" would otherwise be unreachable — the group types "สมชาย" and the
+ * bot answers "ไม่พบชื่อ". Matching is deliberately conservative: exact first,
+ * then case-insensitive, then first-word, then prefix — and ONLY when exactly
+ * one roster entry matches. Ambiguity is reported, never guessed.
+ *
+ * @returns {{ok:true, name:string} | {ok:false, reason:'not_found'|'ambiguous', matches:string[]}}
+ */
+export function matchPlayerName(names, typed) {
+  const roster = (names || []).filter(Boolean).map(String);
+  const q = String(typed ?? "").trim();
+  if (!q) return { ok: false, reason: "not_found", matches: [] };
+
+  const exact = roster.find((n) => n === q);
+  if (exact) return { ok: true, name: exact };
+
+  const fold = (s) => s.toLowerCase().replace(/\s+/g, "");
+  const pick = (list) => {
+    if (list.length === 1) return { ok: true, name: list[0] };
+    if (list.length > 1) return { ok: false, reason: "ambiguous", matches: list };
+    return null;
+  };
+
+  // NOTE: matching stops at whole words on purpose. A partial-word prefix
+  // ("Sam" -> "Sammy") would quietly post one player's score onto another's
+  // card, which is worse than telling the group the name was not found.
+  return (
+    pick(roster.filter((n) => fold(n) === fold(q))) ||
+    pick(roster.filter((n) => fold(n.split(/\s+/)[0]) === fold(q))) || {
+      ok: false,
+      reason: "not_found",
+      matches: [],
+    }
+  );
+}
+
+/**
  * Handicap from the last 3 rounds (spec rule #4).
  *   best = lowest score; weighted = (best*2 + other two) / 4, rounded.
  * Algebraically that equals (sum + best) / 4.
@@ -207,7 +246,11 @@ export function buildGameStructure(players) {
   return { players: computed, diff, ...classifyHandicapLevel(diff) };
 }
 
-const PAR_KEY = { 3: "par3", 4: "par4", 5: "par5" };
+// Par 6 holes exist on a handful of Thai courses and parseParString accepts
+// them, but there is no "par6" row in the rules table — they used to be played
+// scratch at EVERY level, so a 60-shot gap got nothing there. A par 6 is a long
+// hole; it takes the par-5 allowance.
+const PAR_KEY = { 3: "par3", 4: "par4", 5: "par5", 6: "par5" };
 
 /**
  * Strokes a stroke-receiving player gets on a hole of the given par,
@@ -396,14 +439,31 @@ export function settleHoleHeadEatsTail(rows, stake, ctx = null) {
   valid.forEach((r) => (res[r.name] = 0));
   if (valid.length < 2) return res;
 
-  const sorted = [...valid].sort((a, b) => a.net - b.net);
+  // Rank on net, falling back to gross for rows recorded before the course was
+  // known — comparing `undefined` made the sort return NaN, which left the
+  // ranking in whatever order the names happened to be typed.
+  const rank = (r) => (r.net != null ? r.net : r.gross);
+  // Ties are broken by name ONLY to keep the sort total (never money-relevant:
+  // a tied score can never fire a pairing, see `shared` below).
+  const sorted = [...valid].sort((a, b) => rank(a) - rank(b) || String(a.name).localeCompare(String(b.name)));
   const n = sorted.length;
+
+  // How many players share each ranking score.
+  const seen = new Map();
+  for (const r of valid) seen.set(rank(r), (seen.get(rank(r)) || 0) + 1);
+  const shared = (r) => (seen.get(rank(r)) || 0) > 1;
 
   // ชนตัดเจ๊า: cancel ONLY when the two paired players tie each other.
   // Ties between non-paired adjacent players do NOT cancel other pairings.
   for (let i = 0; i < Math.floor(n / 2); i++) {
     const head = sorted[i];
     const tail = sorted[n - 1 - i];
+
+    // A pairing fires only when BOTH ends are unique in the field (the rule this
+    // function documents). Without this, four players tied on 4 were ordered by
+    // who was typed first, so the SAME hole paid different people depending on
+    // the order the names were entered.
+    if (shared(head) || shared(tail)) continue;
 
     // Ranking above is field-relative; the PAYOUT is decided on this pair's own
     // strokes, so the head can lose its pairing when the tail out-nets it there.
@@ -452,7 +512,13 @@ export function settleGame(game) {
       game.course?.holes?.find((h) => Number(h.hole) === Number(hole))?.par ?? null;
     const matrix = matrixForHole(game, hole);
     const results = settleFn(game.holes[hole], stake, matrix ? { par, matrix } : null);
-    for (const name in results) if (name in totals) totals[name] += results[name];
+    // Rows whose name is not on the roster used to be dropped here, so the round
+    // total stopped summing to zero while each hole still balanced. Count them:
+    // a stray name is visible in the summary instead of quietly eating money.
+    for (const name in results) {
+      if (!(name in totals)) totals[name] = 0;
+      totals[name] += results[name];
+    }
     perHole.push({ hole, turbo: mult > 1, stake, results });
   }
   return { perPlayer: totals, perHole, holesCounted: nums.length };

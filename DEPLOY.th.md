@@ -1,5 +1,57 @@
 # คู่มือ Deploy Caddiebot ขึ้น Render (ฟรี)
 
+---
+
+# ⚡ อัปเดตโค้ดที่ deploy ไปแล้ว (ใช้บ่อยสุด — อ่านแค่ส่วนนี้พอ)
+
+Render ตั้งเป็นแบบ **Public Git Repository** ไม่ใช่ auto-deploy ดังนั้น push แล้วยังไม่ขึ้น
+ต้องกด Deploy เองทุกครั้ง รวม 5 ขั้น ~5 นาที
+
+### 1. อัปไฟล์ขึ้น GitHub
+เปิด https://github.com/jatuponrat/caddiebot → **Add file** → **Upload files**
+ลากไฟล์จากโฟลเดอร์ `Documents/Claude/Projects/Caddiebot` ทั้งหมด **ยกเว้น**
+`node_modules/`, `_sync/`, `_backup_*/`, `.env`
+⚠️ ลากโฟลเดอร์ `test/` ไปด้วย (GitHub เก็บ path ให้เอง) → เขียน commit message → **Commit changes**
+
+### 2. ลบไฟล์เทสต์เก่าที่ root (ทำครั้งเดียว)
+ใน repo ถ้ายังมี `engine.test.js` และ `session.test.js` อยู่ที่ root ให้ลบทิ้ง
+(คลิกไฟล์ → ไอคอนถังขยะ → Commit) — ตอนนี้เทสต์อยู่ในโฟลเดอร์ `test/` ที่เดียว
+ถ้าไม่ลบ `npm test` จะรันไฟล์เก่าที่ค้างและฟ้อง fail
+
+### 3. สั่ง Deploy บน Render
+https://dashboard.render.com → service **caddiebot** → ปุ่ม **Manual Deploy** ขวาบน
+→ **Deploy latest commit** → รอจนสถานะเป็น **Live** (~2–3 นาที)
+
+> ⚠️ อย่า deploy ระหว่างที่ก๊วนกำลังตีอยู่ — เกมจะกลับมาได้เพราะเก็บใน Postgres แล้ว
+> แต่ระหว่างรีสตาร์ต ~30 วินาที บอทจะไม่ตอบ
+
+### 4. เช็กว่าขึ้นจริง
+เปิด https://caddiebot.onrender.com/health ต้องได้ครบ 3 อย่าง:
+
+| ค่า | ต้องเป็น | ถ้าไม่ใช่ |
+|---|---|---|
+| `ok` | `true` | ดู Logs ใน Render |
+| `db_connected` | `true` | `DATABASE_URL` ผิด/Supabase หยุดทำงาน → เกมจะหายทุกครั้งที่เครื่องหลับ |
+| `thai_time_now` / `today_room_prefix` | ตรงกับวันเวลาไทย | ตรวจ `ROOM_CODE_TZ` |
+| `uptime_min` | เลขน้อย ๆ | แปลว่าเพิ่ง deploy จริง |
+
+### 5. ทดสอบ
+พิมพ์ในกลุ่ม LINE หรือยิงจากเครื่อง:
+```bash
+curl -sX POST https://caddiebot.onrender.com/simulate \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"สร้างเกม 2 คน","sourceId":"test-deploy"}'
+```
+แล้วลอง `เข้าร่วม แซม 95 92 90` → `หลุม 1 แซม 5` ดูว่าตอบถูก จบแล้วพิมพ์ `จบเกม` เพื่อปิดห้องทดสอบ
+
+### ทำครั้งเดียว: กันเครื่องหลับ
+Render → Environment → เพิ่ม `SELF_URL` = `https://caddiebot.onrender.com` → Save
+บอทจะ ping ตัวเองทุก 10 นาที (`/health` จะขึ้น `keep_alive: true`) ลดอาการเงียบกลางรอบ
+
+---
+
+# ติดตั้งครั้งแรก (ถ้าต้องสร้าง service ใหม่)
+
 บอทนี้เป็น Node.js ที่ต้องรันตลอดเวลา + มี HTTPS — shared hosting (DirectAdmin/cPanel)
 รันไม่ได้ เราจึงใช้ **Render** ซึ่งฟรีและให้ HTTPS มาให้อัตโนมัติ
 
@@ -93,9 +145,8 @@ Build Command = `npm install`, Start Command = `npm start`, Health Check Path = 
 
 - **หลับเมื่อว่าง ~15 นาที** — คนแรกที่ทักหลังหลับจะรอ ~30 วินาที (cold start)
   ถ้าต้องการให้ตื่นตลอด: อัปเป็น Starter plan (~$7/เดือน) หรือย้ายไป VPS
-- **state เป็น in-memory** — เกมจะหายเมื่อ service หลับ/redeploy
-  แก้ได้ด้วยการต่อฐานข้อมูล (ดูคอมเมนต์ใน `render.yaml` — เพิ่ม Postgres) แล้วเขียน
-  adapter ใน `gameStore.js` (บอกผมได้ เดี๋ยวทำให้)
+- **state เก็บใน Postgres แล้ว** (ตั้งแต่ 28 ก.ค. 2026) — เกมที่ค้างอยู่กลับมาได้หลัง redeploy
+  ถ้า `/health` ขึ้น `db_connected: false` แปลว่าไม่ได้เก็บจริง ให้แก้ `DATABASE_URL` ก่อน
 
 ---
 
@@ -107,4 +158,5 @@ Build Command = `npm install`, Start Command = `npm start`, Health Check Path = 
 | บอทไม่ตอบในกลุ่ม | ยังไม่เปิด *Allow bot to join group chats* หรือ *Use webhook* หรือยังไม่ปิด Auto-reply |
 | ตอบ error 401 (ใน Logs) | `LINE_CHANNEL_SECRET` ผิด |
 | ส่งข้อความแล้วเงียบ | `LINE_CHANNEL_ACCESS_TOKEN` ผิด/หมดอายุ → Issue ใหม่ |
-| เกมหายบ่อย | free tier หลับ + in-memory → ต่อ DB |
+| เกมหายบ่อย | เช็ก `/health` → `db_connected` ต้องเป็น true และตั้ง `SELF_URL` กันหลับ |
+| deploy แล้วโค้ดไม่เปลี่ยน | ลืมกด Manual Deploy → Deploy latest commit |

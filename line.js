@@ -15,6 +15,12 @@ const REPLY_URL = "https://api.line.me/v2/bot/message/reply";
  */
 export function verifySignature(rawBody, signature, channelSecret) {
   if (!channelSecret || !signature) return false;
+  // A request whose Content-Type is not JSON never runs express.json's `verify`
+  // hook, so rawBody is undefined and crypto would THROW — which, on an async
+  // Express 4 route, means an unhandled rejection and a dead process. An
+  // unverifiable body is simply not a valid signature.
+  if (rawBody == null) return false;
+  if (!Buffer.isBuffer(rawBody) && typeof rawBody !== "string") return false;
   const expected = crypto
     .createHmac("sha256", channelSecret)
     .update(rawBody)
