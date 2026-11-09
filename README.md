@@ -48,10 +48,13 @@ Add the bot to a LINE group and **that group becomes the room** — state is key
 by `groupId`, so members just chat (no need to retype the room code):
 
 1. Add the bot → it posts a Thai welcome with the commands.
-2. Anyone: `สร้างเกม 4 คน` → bot creates the room.
+2. Anyone: `สร้างเกม 4 คน` → bot creates the room and asks for the pars of
+   holes 1-9 (`454354434`), then `ยืนยัน`. Holes 10-18 are asked for at the turn:
+   after hole 9 the bot posts the front-nine money, then asks for `443535444`
+   and `ยืนยัน` (the same check as holes 1-9), and only then announces hole 10. Never all 18 digits in one message; no
+   course name is asked for and no course is remembered between games.
 3. Each player: `เข้าร่วม ชื่อ A 92,95,90` → handicap computed, roster updates.
-4. Type the par card: a preset course name, or `454354434 443535444`.
-5. Each hole: `หลุม 1 A 5 B 6 C 5 D 7` → net computed from stored handicaps.
+4. Each hole: `หลุม 1 A 5 B 6 C 5 D 7` → net computed from stored handicaps.
 
 The bot replies with the friendly Thai `summary.message`; the full JSON envelope
 still goes to your backend. State is in-memory (`src/gameStore.js`) — swap for a

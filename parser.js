@@ -25,6 +25,12 @@ export function detectIntent(text) {
   if (/^\s*[\[{]/.test(raw)) return "course_json"; // pasted JSON course
   const t = normalize(raw);
 
+  // "แก้พาร์ …" — correct a card that was saved wrong. Checked FIRST: the
+  // one-hole form ("แก้พาร์ หลุม 7 เป็น 5") otherwise reads as a score line.
+  if (/(แก้พาร์|แก้ไขพาร์|เปลี่ยนพาร์|พาร์ผิด|พาร์ไม่ถูก|แก้สนาม|fix\s*par|edit\s*par)/i.test(t)) {
+    return "edit_par";
+  }
+
   // A line that really is a score or a join wins over any command word inside
   // it. "หลุม 1 แซม 5 บอย 6 สรุปทีหลังนะ" used to be read as "สรุป" and the
   // scores were dropped without a word; "เข้าร่วม จบเกม 95 92 90" ENDED the
@@ -86,6 +92,11 @@ export function detectIntent(text) {
   const compact = noKw.replace(/\s+/g, "");
   if (noKw.length !== t.length && /\d/.test(compact)) return "par_string"; // explicit keyword
   if (/^\d{16,20}$/.test(compact)) return "par_string"; // bare ~18-digit par card
+  // Nine holes of par ("454354434"), typed one nine at a time. Checked before
+  // the room-code join fallback below, which would otherwise read it as a
+  // 9-digit room code. No real room code can match: its month (01-12) always
+  // carries a 0, 1 or 2, and a par is 3-6.
+  if (/^[3-6]{9}$/.test(compact)) return "par_string";
   // Bulk per-player card: "แซม 544535445 445354454" (name + 18 single-digit holes).
   // The name may be several words ("สมชาย ใจดี 445345434 453443544"). With a
   // single-token name required here, such a card fell through to the join
@@ -99,6 +110,31 @@ export function detectIntent(text) {
   if (/\b\d{9}\b/.test(t) && (t.match(/\d{2,3}/g) || []).length >= 3) return "join";
   if (/\b\d{4}\b/.test(t) && (t.match(/\d{2,3}/g) || []).length >= 4) return "join";
   return "unknown";
+}
+
+/**
+ * A par correction, in either form:
+ *   "แก้พาร์ 454354434 443535444"   -> the whole 18-hole card
+ *   "แก้พาร์ หลุม 7 เป็น 5"          -> one hole
+ *   "แก้พาร์"                        -> nothing yet, ask for it
+ * @returns {{card:{ok,holes,total,out,in}|null, hole:number|null, par:number|null}}
+ */
+export function parseParEdit(text) {
+  const t = normalize(text).replace(
+    /(แก้ไขพาร์|แก้พาร์|เปลี่ยนพาร์|พาร์ผิด|พาร์ไม่ถูก|แก้สนาม|fix\s*par|edit\s*par)/gi,
+    " "
+  );
+  const digitsOnly = t.replace(/\D/g, "");
+  if (digitsOnly.length === 18) {
+    const card = parseParString(t);
+    if (card.ok) return { card, hole: null, par: null };
+  }
+  // one hole: "หลุม 7 เป็น 5" / "หลุม 7 5" / "7 = 5"
+  const m =
+    t.match(/(?:หลุม|hole|h)\s*(\d{1,2})\s*(?:เป็น|=|คือ|:)?\s*(?:พาร์|par)?\s*(\d)\b/i) ||
+    t.match(/^\s*(\d{1,2})\s*(?:เป็น|=|คือ|:)\s*(\d)\s*$/);
+  if (m) return { card: null, hole: Number(m[1]), par: Number(m[2]) };
+  return { card: null, hole: null, par: null };
 }
 
 /** "หลุมละ 1,000 บาท" -> 1000. Commas and Thai digits included. */
@@ -266,13 +302,16 @@ export function parseHoleScores(text) {
   };
 }
 
+/** "พาร์ 454354434" — the keyword in front of a par card is optional. */
+const PAR_KEYWORD_RE = /^(พาร์|par|สนาม|course)\s*[:：]?\s*/i;
+
 /**
  * Course par card entered as 18 par digits, e.g. "454354434 443535444" (9+9),
  * "454354434443535444", or "พาร์ 454354434 443535444". Each digit is a par (3-6).
  * @returns {{ok:true, holes, out, in, total} | {ok:false, reason:'count'|'range', ...}}
  */
 export function parseParString(text) {
-  const t = normalize(text).replace(/^(พาร์|par|สนาม|course)\s*[:：]?\s*/i, "");
+  const t = normalize(text).replace(PAR_KEYWORD_RE, "");
   const digits = t.replace(/\D/g, "");
   if (digits.length !== 18) return { ok: false, reason: "count", count: digits.length };
   const pars = digits.split("").map(Number);
@@ -283,33 +322,32 @@ export function parseParString(text) {
   return { ok: true, holes, out, in: inn, total: out + inn };
 }
 
-// Built-in courses: typing the name auto-loads the pars. Add more here.
-const PRESET_COURSES = [
-  { aliases: ["the pine", "thepine", "pine", "เดอะไพน์", "ไพน์"], pars: "445345434453443544" },
-  { aliases: ["rachakram", "racha", "ราชาคราม", "ราชาคาม"], pars: "445344435435454434" },
-];
+/**
+ * One nine of the par card — holes 1-9 or 10-18 — e.g. "454354434".
+ * Pars are entered nine holes at a time; which nine it is depends on what the
+ * round is waiting for, not on the message.
+ * @returns {{ok:true, pars:number[], total:number} | {ok:false, reason:'count'|'range', count?:number}}
+ */
+export function parseParNine(text) {
+  const t = normalize(text).replace(PAR_KEYWORD_RE, "");
+  const digits = t.replace(/\D/g, "");
+  if (digits.length !== 9) return { ok: false, reason: "count", count: digits.length };
+  const pars = digits.split("").map(Number);
+  if (pars.some((p) => p < 3 || p > 6)) return { ok: false, reason: "range", pars };
+  return { ok: true, pars, total: pars.reduce((a, b) => a + b, 0) };
+}
 
 /**
- * Look up a built-in course by (fuzzy) name. Returns the parsed par card plus a
- * canonical `preset` name, or null if the name isn't a known course.
+ * The digits of a message that is NOTHING BUT a par card — "454354434",
+ * "4 5 4 3 5 4 4 3 4", "4-5-4-3-5-4-4-3-4", "พาร์ 454354434 443535444".
+ * Returns null as soon as the message carries anything else (a name, a word),
+ * so a score card or a join can never be mistaken for pars.
  */
-export function lookupPresetCourse(name) {
-  const key = normalize(name).toLowerCase().replace(/\s+/g, "");
-  if (key.length < 3) return null;
-  // Match the whole name, or the alias as a leading run of WHOLE words
-  // ("the pine golf club" -> the pine). A bare character-prefix match meant
-  // "ไพน์เฮิร์สท" (Pinehurst — a different course) silently loaded The Pine's
-  // card, and every stroke, net and baht for the round came off the wrong pars.
-  const words = normalize(name).toLowerCase().split(/\s+/).filter(Boolean);
-  for (const c of PRESET_COURSES) {
-    const hit = c.aliases.some((a) => {
-      const aw = a.toLowerCase().split(/\s+/).filter(Boolean);
-      if (key === aw.join("")) return true;
-      return words.length > aw.length && words.slice(0, aw.length).join(" ") === aw.join(" ");
-    });
-    if (hit) return { ...parseParString(c.pars), preset: c.aliases[0] };
-  }
-  return null;
+export function parDigitsOnly(text) {
+  const t = normalize(text).replace(PAR_KEYWORD_RE, "");
+  if (!t || !/^[\d\s,.\-/]+$/.test(t)) return null;
+  const digits = t.replace(/\D/g, "");
+  return digits || null;
 }
 
 /**

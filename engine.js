@@ -356,14 +356,21 @@ export function computeNet(gross, strokes = 0) {
 /**
  * Validate an extracted course (spec rule #1). Returns {valid, errors, course}.
  * Expects 18 holes with sane par values. Does not throw.
+ *
+ * `allowFrontNine`: a round's card is typed in two halves — holes 1-9 when the
+ * game is set up, holes 10-18 at the turn — so in between, holes 1-9 alone are
+ * a valid card. Holes 10-18 simply have no par yet.
  */
-export function validateCourse(course) {
+export function validateCourse(course, { allowFrontNine = false } = {}) {
   const errors = [];
   if (!course || typeof course !== "object") {
     return { valid: false, errors: ["course missing or not an object"], course: null };
   }
   const holes = Array.isArray(course.holes) ? course.holes : [];
-  if (holes.length !== 18) errors.push(`expected 18 holes, got ${holes.length}`);
+  const sizeOk = holes.length === 18 || (allowFrontNine && holes.length === 9);
+  if (!sizeOk) {
+    errors.push(`expected 18 holes${allowFrontNine ? " (or holes 1-9)" : ""}, got ${holes.length}`);
+  }
   holes.forEach((h, i) => {
     const num = Number(h?.hole);
     const par = Number(h?.par);

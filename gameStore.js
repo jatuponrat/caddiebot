@@ -38,6 +38,14 @@ import {
 export const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 const TURBO_HOLES = [9, 18]; // closing hole of each nine
 
+/**
+ * Setup steps that are waiting for the front-nine pars. "course" and
+ * "await_pars" are the old name-first steps: a round that was mid-setup when
+ * this version was deployed is restored from Postgres with one of them, and
+ * simply carries on with the front nine.
+ */
+export const PAR_ENTRY_STEPS = new Set(["pars_front", "course", "await_pars"]);
+
 export class GameStore {
   constructor() {
     this.rooms = new Map(); // room_code -> game
@@ -371,15 +379,18 @@ export class GameStore {
       expected_players,
       status: "waiting_players",
       // --- game setup, collected via guided Q&A after "สร้างเกม" ---
-      course_name: null,
+      course_name: null, // no longer asked — kept so old rounds still read
       stake: null, // money per hole; RECORDED for backend, never settled here
       turbo: null, // boolean
       turbo_holes: [], // e.g. [9, 18] when turbo is on
       format: null, // "all_vs_all" | "head_tail"
-      setup: "course", // pending step: course -> [confirm_course] -> stake -> turbo -> format -> done
-      pending_course: null, // {holes,total} awaiting "ยืนยัน" when entered as name+par
+      // pending step: pars_front -> confirm_course -> stake -> turbo -> format -> done
+      // (the back nine's pars are asked for at the turn, after hole 9)
+      setup: "pars_front",
+      pending_course: null, // {holes,total} — holes 1-9 typed, awaiting "ยืนยัน"
+      pending_back9: null, // {pars,total} — holes 10-18 typed at the turn, awaiting "ยืนยัน"
       // --- play data ---
-      course: null, // 18-hole par data
+      course: null, // par data: holes 1-9 until the turn, then all 18
       players: [], // { name, scores, handicap_index }
       diff: null,
       handicap_level: null,
@@ -437,56 +448,99 @@ export class GameStore {
     return this._resolve(null, sourceId);
   }
 
-  setCourseName(sourceId, name) {
+  /** The first setup question that is still unanswered once the pars are in. */
+  _nextSetupStep(game) {
+    if (game.stake == null) return "stake";
+    if (game.turbo == null) return "turbo";
+    if (!game.format) return "format";
+    return "done";
+  }
+
+  /** Holes 1-9 typed outside the setup Q&A (it closed early): they count at
+   *  once. Holes 10-18 follow at the turn (setBackNine). */
+  setFrontNine(sourceId, pars) {
     const game = this._resolve(null, sourceId);
     if (!game) return { ok: false, error: "no active game" };
-    game.course_name = String(name || "").trim() || null;
-    game.setup = "stake";
+    const holes = pars.slice(0, 9).map((par, i) => ({ hole: i + 1, par: Number(par) }));
+    return this.setCourse(null, sourceId, { name: game.course_name || "", holes });
+  }
+
+  /** Holes 10-18 typed at the turn: held until the group types "ยืนยัน",
+   *  exactly like holes 1-9 in the setup. Typing them again replaces them. */
+  setPendingBackNine(sourceId, pars) {
+    const game = this._resolve(null, sourceId);
+    if (!game) return { ok: false, error: "no active game" };
+    if (game.course?.holes?.length !== 9) return { ok: false, error: "front_nine_first", game };
+    const p = pars.slice(0, 9).map(Number);
+    game.pending_back9 = { pars: p, total: p.reduce((a, b) => a + b, 0) };
     this._persist(game);
     return { ok: true, game };
   }
 
-  /** Course name not found — keep the name and wait for the user to type the pars. */
-  awaitPars(sourceId, name) {
+  /** "ยืนยัน": the held back nine completes the card. */
+  confirmBackNine(sourceId) {
+    const game = this._resolve(null, sourceId);
+    if (!game?.pending_back9) return { ok: false, error: "no_pending_back_nine", game };
+    const { pars, total } = game.pending_back9;
+    const r = this.setBackNine(sourceId, pars); // setCourse clears pending_back9
+    return r.ok ? { ...r, back_total: total } : r;
+  }
+
+  /** "แก้ไข": drop the held back nine; it is asked for again. */
+  dropPendingBackNine(sourceId) {
     const game = this._resolve(null, sourceId);
     if (!game) return { ok: false, error: "no active game" };
-    game.course_name = String(name || "").trim() || null;
-    game.setup = "await_pars";
+    game.pending_back9 = null;
     this._persist(game);
     return { ok: true, game };
   }
 
-  /** Stash a name+par course awaiting the user's "ยืนยัน". */
-  setPendingCourse(sourceId, name, holes, total) {
+  /** Holes 10-18 confirmed: completes the card. Holes already played on the
+   *  back nine get their net (and money) recomputed by setCourse. */
+  setBackNine(sourceId, pars) {
     const game = this._resolve(null, sourceId);
     if (!game) return { ok: false, error: "no active game" };
-    game.course_name = String(name || "").trim() || null;
+    if (game.course?.holes?.length !== 9) return { ok: false, error: "front_nine_first", game };
+    const holes = [
+      ...game.course.holes.map((h) => ({ hole: Number(h.hole), par: Number(h.par) })),
+      ...pars.slice(0, 9).map((par, i) => ({ hole: 10 + i, par: Number(par) })),
+    ];
+    return this.setCourse(null, sourceId, { name: game.course_name || "", holes });
+  }
+
+  /** Stash typed pars (holes 1-9) until the group types "ยืนยัน". */
+  setPendingCourse(sourceId, holes, total) {
+    const game = this._resolve(null, sourceId);
+    if (!game) return { ok: false, error: "no active game" };
     game.pending_course = { holes, total };
     game.setup = "confirm_course";
     this._persist(game);
     return { ok: true, game };
   }
 
-  /** Apply the pending course after confirmation, then move on to stake. */
+  /** Apply the pending card after confirmation, then move on to the stake. */
   confirmCourse(sourceId) {
     const game = this._resolve(null, sourceId);
     if (!game || !game.pending_course) return { ok: false, error: "no pending course" };
-    const { course } = validateCourse({ name: game.course_name, holes: game.pending_course.holes });
+    const { course } = validateCourse(
+      { name: game.course_name || "", holes: game.pending_course.holes },
+      { allowFrontNine: true }
+    );
     game.course = course;
     const total = game.pending_course.total;
     game.pending_course = null;
-    game.setup = "stake";
+    game.setup = this._nextSetupStep(game);
     if (game.rules) this._recomputeNets(game);
     this._persist(game);
     return { ok: true, game, total };
   }
 
-  /** Discard the pending course and ask for the pars again (keep the name). */
+  /** Throw away the typed pars and ask for holes 1-9 again. */
   editCourse(sourceId) {
     const game = this._resolve(null, sourceId);
     if (!game) return { ok: false, error: "no active game" };
     game.pending_course = null;
-    game.setup = "await_pars";
+    game.setup = "pars_front";
     this._persist(game);
     return { ok: true, game };
   }
@@ -546,13 +600,21 @@ export class GameStore {
   setCourse(room_code, sourceId, courseInput) {
     const game = this._resolve(room_code, sourceId);
     if (!game) return { ok: false, error: "no active game" };
-    const { valid, errors, course } = validateCourse(courseInput);
+    // Holes 1-9 alone are a valid card until the back nine is typed at the turn.
+    const { valid, errors, course } = validateCourse(courseInput, { allowFrontNine: true });
     // Only a VALID card is stored. It used to be assigned before this check, so
     // a card the bot rejected out loud ("ข้อมูลสนามไม่ครบ 18 หลุม") was still in
     // play: its missing holes had no par, so they settled for nothing while
     // still counting towards the round.
     if (!valid) return { ok: false, errors, game };
     game.course = course;
+    // A stored card supersedes anything still awaiting ยืนยัน, and answers the
+    // setup question if the Q&A was still waiting for the pars.
+    game.pending_course = null;
+    if (course.holes.length === 18) game.pending_back9 = null;
+    if (PAR_ENTRY_STEPS.has(game.setup) || game.setup === "confirm_course") {
+      game.setup = this._nextSetupStep(game);
+    }
     // Retroactively compute net for holes recorded before the course was set.
     if (game.rules) this._recomputeNets(game);
     this._persist(game);

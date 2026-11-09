@@ -8,7 +8,6 @@ import { GameStore, SESSION_TTL_MS } from "./gameStore.js";
 import { dispatchAsync, welcomeMessage, isIdle } from "./session.js";
 import { verifySignature, replyJson, replyText } from "./line.js";
 import { initDb, dbEnabled, dbLastError, findRound, listRounds } from "./db.js";
-import { loadCoursesFromDb } from "./courseStore.js";
 import {
   normalizeRoomCode,
   dateKeyDDMMYY,
@@ -149,13 +148,13 @@ async function tryConnectDb() {
   _dbStatus.connected = ok;
   _dbStatus.error = ok ? null : dbLastError();
   if (!ok) return false;
-  const [courses, sessions] = await Promise.all([loadCoursesFromDb(), store.loadFromDb()]);
+  const sessions = await store.loadFromDb();
   // Archive anything that expired while the process was down/asleep, THEN seed
   // today's running number — the sweep can add rounds that the seed must see.
   const swept = await store.sweepExpired();
   const seq = await store.seedRoomSeq();
   console.log(
-    `[caddiebot] DB ready — loaded ${courses} course(s), ${sessions} active session(s), ` +
+    `[caddiebot] DB ready — loaded ${sessions} active session(s), ` +
       `archived ${swept} expired round(s), room seq at ${seq}`
   );
   return true;
@@ -239,7 +238,7 @@ export async function processEvent(ev) {
 
   // Images, stickers, files, audio — the bot is text-only and stays silent.
   // Scorecard-photo reading (AI vision) was removed: pars are typed in instead,
-  // either as a preset course name or the 18-digit par card.
+  // nine holes at a time ("454354434", then "443535444").
   return;
 }
 
