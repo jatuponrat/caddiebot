@@ -364,6 +364,16 @@ export class GameStore {
     return game;
   }
 
+  /** Persist bookkeeping that is NOT game activity (a flag cleared because
+   *  someone chatted): written to the DB WITHOUT renewing the 12h window —
+   *  plain chatter must never keep a stale game alive. */
+  saveQuiet(game) {
+    if (!game?.source_id) return game;
+    const snapshot = JSON.parse(JSON.stringify(game));
+    this._queue(game.source_id, () => saveSession(game.source_id, snapshot), "persist");
+    return game;
+  }
+
   createGame(sourceId, { expected_players = null } = {}) {
     // "สร้างเกม" always starts from a clean slate — discard whatever this
     // source had before (finished, abandoned or expired).
@@ -388,6 +398,7 @@ export class GameStore {
       // (the back nine's pars are asked for at the turn, after hole 9)
       setup: "pars_front",
       pending_course: null, // {holes,total} — holes 1-9 typed, awaiting "ยืนยัน"
+      pending_front9: null, // {pars,total} — holes 1-9 typed after the setup closed, awaiting "ยืนยัน"
       pending_back9: null, // {pars,total} — holes 10-18 typed at the turn, awaiting "ยืนยัน"
       // --- play data ---
       course: null, // par data: holes 1-9 until the turn, then all 18
@@ -456,8 +467,39 @@ export class GameStore {
     return "done";
   }
 
-  /** Holes 1-9 typed outside the setup Q&A (it closed early): they count at
-   *  once. Holes 10-18 follow at the turn (setBackNine). */
+  /** Holes 1-9 typed after the setup Q&A closed: held until "ยืนยัน", exactly
+   *  like holes 1-9 inside the setup. Typing them again replaces them. */
+  holdFrontNine(sourceId, pars) {
+    const game = this._resolve(null, sourceId);
+    if (!game) return { ok: false, error: "no active game" };
+    if (game.course) return { ok: false, error: "front_nine_known", game };
+    const p = pars.slice(0, 9).map(Number);
+    game.pending_front9 = { pars: p, total: p.reduce((a, b) => a + b, 0) };
+    game.pending_course = null;
+    this._persist(game);
+    return { ok: true, game };
+  }
+
+  /** "ยืนยัน": the held front nine becomes the round's card (holes 1-9). */
+  confirmFrontNine(sourceId) {
+    const game = this._resolve(null, sourceId);
+    if (!game?.pending_front9) return { ok: false, error: "no_pending_front_nine", game };
+    const { pars, total } = game.pending_front9;
+    const r = this.setFrontNine(sourceId, pars); // setCourse clears pending_front9
+    return r.ok ? { ...r, front_total: total } : r;
+  }
+
+  /** "แก้ไข": drop the held front nine; it is asked for again. */
+  dropPendingFrontNine(sourceId) {
+    const game = this._resolve(null, sourceId);
+    if (!game) return { ok: false, error: "no active game" };
+    game.pending_front9 = null;
+    this._persist(game);
+    return { ok: true, game };
+  }
+
+  /** Holes 1-9 confirmed outside the setup Q&A: they become the card.
+   *  Holes 10-18 follow at the turn (setBackNine). */
   setFrontNine(sourceId, pars) {
     const game = this._resolve(null, sourceId);
     if (!game) return { ok: false, error: "no active game" };
@@ -611,6 +653,7 @@ export class GameStore {
     // A stored card supersedes anything still awaiting ยืนยัน, and answers the
     // setup question if the Q&A was still waiting for the pars.
     game.pending_course = null;
+    game.pending_front9 = null;
     if (course.holes.length === 18) game.pending_back9 = null;
     if (PAR_ENTRY_STEPS.has(game.setup) || game.setup === "confirm_course") {
       game.setup = this._nextSetupStep(game);

@@ -83,7 +83,10 @@ function atTheTurn(game) {
 
 /** What to type next to give the round its pars. */
 function parPrompt(game) {
-  if (game?.pending_back9) return `พาร์ 9 หลุมหลังรอยืนยัน: พิมพ์ "ยืนยัน" ถ้าถูกต้อง หรือ "แก้ไข" เพื่อกรอกใหม่`;
+  const held = heldNine(game);
+  if (held) {
+    return `พาร์ 9 หลุม${held.first === 1 ? "แรก" : "หลัง"}รอยืนยัน: พิมพ์ "ยืนยัน" ถ้าถูกต้อง หรือ "แก้ไข" เพื่อกรอกใหม่`;
+  }
   return knownHoles(game) === 9
     ? `กรอกพาร์ 9 หลุมหลัง (หลุม 10-18) เช่น "${BACK_EG}"`
     : `กรอกพาร์ 9 หลุมแรก (หลุม 1-9) เช่น "${FRONT_EG}"`;
@@ -103,53 +106,73 @@ function parsOf(holes) {
     .map((h) => Number(h.par));
 }
 
+/** A nine typed outside the setup Q&A and waiting for "ยืนยัน": holes 1-9
+ *  (the setup had already closed) or holes 10-18 (at the turn). */
+function heldNine(game) {
+  if (game?.pending_front9) return { first: 1, ...game.pending_front9 };
+  if (game?.pending_back9) return { first: 10, ...game.pending_back9 };
+  return null;
+}
+
 /**
- * Back-nine holes have been scored but their pars were never typed: those holes
- * settle as nothing until they are. Said wherever money is shown, so a total
- * missing half the round is never presented as the real thing.
+ * Holes have been scored whose pars are not in yet (never typed, or typed and
+ * still waiting for ยืนยัน): they settle as nothing until the pars count. Said
+ * wherever money is shown, so a total missing holes is never presented as the
+ * real thing — and it says what to type to fix it.
  */
-function backNineWarning(game) {
-  if (knownHoles(game) !== 9) return "";
-  if (!Object.keys(game.holes || {}).some((h) => Number(h) >= 10)) return "";
-  const what = game.pending_back9 ? "พาร์ 9 หลุมหลังยังไม่ได้ยืนยัน" : "ยังไม่มีพาร์ 9 หลุมหลัง";
-  return `⚠️ ${what} — หลุม 10-18 ยังไม่คิดเงิน\n${parPrompt(game)}`;
+function missingParsWarning(game) {
+  const known = knownHoles(game);
+  if (known >= 18) return "";
+  const scored = Object.keys(game.holes || {}).map(Number);
+  const front = known === 0 && scored.some((h) => h <= 9);
+  const back = scored.some((h) => h >= 10);
+  if (!front && !back) return "";
+  const range = front && back ? "หลุม 1-18" : front ? "หลุม 1-9" : "หลุม 10-18";
+  const held = heldNine(game);
+  const what = held
+    ? `พาร์ 9 หลุม${held.first === 1 ? "แรก" : "หลัง"}ยังไม่ได้ยืนยัน`
+    : known === 0
+      ? "ยังไม่มีพาร์สนาม"
+      : "ยังไม่มีพาร์ 9 หลุมหลัง";
+  return `⚠️ ${what} — ${range} ยังไม่คิดเงิน\n${parPrompt(game)}`;
 }
 
-/** Holes 10-18 read back for "ยืนยัน" — the same check holes 1-9 get. */
-function backNineConfirmMessage(game) {
-  const { pars, total } = game.pending_back9;
-  return (
-    `${nineLine(pars, 10)} — พาร์รวม ${(game.course?.total_par || 0) + total}\n` +
-    `ถูกต้องไหมครับ? (พิมพ์ ยืนยัน / แก้ไข)`
-  );
+/** Holes have been scored but no stake was ever set: say so (and that setting
+ *  it now prices those holes too) instead of showing a silent 0. */
+function noStakeWarning(game) {
+  if (game.stake || !Object.keys(game.holes || {}).length) return "";
+  return `⚠️ ยังไม่ได้ตั้งเงินเดิมพัน — ยังไม่คิดเงิน\n` +
+    `พิมพ์ "หลุมละ 20" แล้วบอทจะคิดเงินทุกหลุมที่ลงไปแล้วให้`;
 }
 
-/** "บันทึกพาร์ 9 หลุมหลังแล้ว … ⛳ หลุม 10 Par 4 เริ่ม !!" once holes 10-18 count. */
-function backNineSavedMessage(game, backTotal, scoredBack) {
+/** A held nine read back for "ยืนยัน" — the same check the setup gives holes 1-9. */
+function heldNineConfirmMessage(game) {
+  const held = heldNine(game);
+  if (!held) return "";
+  return held.first === 1
+    ? `${nineLine(held.pars)}\nถูกต้องไหมครับ? (พิมพ์ ยืนยัน / แก้ไข)`
+    : `${nineLine(held.pars, 10)} — พาร์รวม ${(game.course?.total_par || 0) + held.total}\n` +
+        `ถูกต้องไหมครับ? (พิมพ์ ยืนยัน / แก้ไข)`;
+}
+
+/** The reply once a held nine counts: what was saved, what the money did, and
+ *  where the round goes next. */
+function heldNineSavedMessage(game, first, nineTotal, alreadyScored, store) {
+  const settled = alreadyScored ? `\n💰 คิดเงินหลุมที่ลงไปแล้วให้แล้ว — พิมพ์ "ยอดล่าสุด" ดูยอด` : "";
+  if (first === 1) {
+    return (
+      `บันทึกพาร์ 9 หลุมแรกแล้ว (OUT ${nineTotal}) ✅\n9 หลุมหลังบอทจะถามตอนจบหลุม 9` +
+      settled +
+      maybeStartRound(game, store)
+    );
+  }
   const total = game.course.total_par;
   const note = total < 69 || total > 74 ? " (ปกติ 70–72 ลองเช็กอีกครั้ง)" : "";
   const cur = game.current_hole;
   return (
-    `บันทึกพาร์ 9 หลุมหลังแล้ว (IN ${backTotal}) ✅ — พาร์รวม ${total}${note}` +
-    // Holes already played on the back nine are settled now that their pars exist.
-    (scoredBack ? `\n💰 คิดเงินหลุมหลังที่ลงไปแล้วให้แล้ว — พิมพ์ "ยอดล่าสุด" ดูยอด` : "") +
+    `บันทึกพาร์ 9 หลุมหลังแล้ว (IN ${nineTotal}) ✅ — พาร์รวม ${total}${note}` +
+    settled +
     (cur && cur <= 18 ? `\n${holeAnnounce(game, cur)}` : "")
-  );
-}
-
-/**
- * Holes 10-18 were typed at the turn but nobody answered ยืนยัน, and the round
- * has moved on (a back-nine hole scored, or the money asked for). Dropping the
- * typed pars would leave holes 10-18 without money — use them, and say how to
- * fix them. The same happens to holes 1-9 when a join lands on their ยืนยัน.
- */
-function useTypedBackNine(store, sourceId) {
-  if (!store.activeGame(sourceId)?.pending_back9) return "";
-  const r = store.confirmBackNine(sourceId);
-  if (!r.ok) return "";
-  return (
-    `✅ ใช้พาร์ 9 หลุมหลังที่กรอกไว้ (IN ${r.back_total}) — พาร์รวม ${r.game.course.total_par}` +
-    ` · ถ้าผิด พิมพ์ "แก้พาร์ หลุม 12 เป็น 5"`
   );
 }
 
@@ -254,7 +277,10 @@ export function backNineParCheck(game) {
  * that change still carries one).
  */
 export function parCardMessage(game, { pendingNote = true } = {}) {
-  const holes = game?.course?.holes || game?.pending_course?.holes || null;
+  const heldFront = !game?.course && game?.pending_front9
+    ? game.pending_front9.pars.map((par, i) => ({ hole: i + 1, par }))
+    : null;
+  const holes = game?.course?.holes || game?.pending_course?.holes || heldFront || null;
   if (!holes || (holes.length !== 18 && holes.length !== 9)) return null;
   const pars = parsOf(holes);
   const out = pars.slice(0, 9).reduce((a, b) => a + b, 0);
@@ -287,7 +313,7 @@ export function parCardMessage(game, { pendingNote = true } = {}) {
     ];
   }
   if (turbo.length) lines.push(`🔥 หลุมเทอร์โบ (เงินคูณ 2): ${turbo.join(", ")}`);
-  if (pendingNote && !game.course && game.pending_course) {
+  if (pendingNote && !game.course && (game.pending_course || game.pending_front9)) {
     lines.push(`⚠️ ยังไม่ได้ยืนยัน — พิมพ์ "ยืนยัน" ถ้าถูกต้อง หรือ "แก้ไข" เพื่อกรอกใหม่`);
   }
   if (pendingNote && heldBack) {
@@ -391,8 +417,10 @@ export function standingsMessage(game, title = null) {
   if (turboLeft.length) tail.push(`หลุมเทอร์โบที่ยังไม่เล่น: ${turboLeft.join(", ")} 🔥`);
   if (tail.length) lines.push("", tail.join(" · "));
   if (left === 0) lines.push("", `🏁 ครบ 18 หลุมแล้ว — พิมพ์ "จบเกม" เพื่อปิดห้อง`);
-  const warn = backNineWarning(game);
+  const warn = missingParsWarning(game);
   if (warn) lines.push("", warn);
+  const stakeWarn = noStakeWarning(game);
+  if (stakeWarn) lines.push("", stakeWarn);
   return lines.join("\n");
 }
 
@@ -469,9 +497,11 @@ export function statusMessage(game, store) {
   if (game.back9_handicap) tail.push("ใช้แต้มต่อใหม่สำหรับ 9 หลุมหลังแล้ว");
   lines.push("", tail.join(" · "));
 
-  // Where the round is right now. At the turn that is: waiting for the back nine.
-  if (knownHoles(game) === 9 && atTheTurn(game)) {
-    lines.push(backNineWarning(game) || `⛳ ${parPrompt(game)}`);
+  // Where the round is right now. With pars missing, that is what the round
+  // is waiting for: holes 1-9 (or their ยืนยัน), or holes 10-18 at the turn.
+  const parsWanted = !game.course || (knownHoles(game) === 9 && atTheTurn(game));
+  if (parsWanted) {
+    lines.push(missingParsWarning(game) || `⛳ ${parPrompt(game)}`);
   } else if (game.current_hole && game.current_hole <= 18) {
     lines.push(holeAnnounce(game, game.current_hole).replace("เริ่ม !!", "กำลังเล่น"));
     const waiting = (game.players || [])
@@ -632,6 +662,9 @@ export function isIdle(payload) {
 export function dispatch(text, sourceId, store) {
   const raw = String(text ?? "");
   const intent = detectIntent(text);
+  // What was said, for the yes / no / cancel checks below: quotes copied from
+  // the bot's own examples (“ยืนยัน”) and Thai digits do not change the answer.
+  const said = normalize(raw);
 
   // --- 12h idle kill switch ------------------------------------------------
   // A game expires 12 hours after the LAST activity (rolling window — see
@@ -653,7 +686,7 @@ export function dispatch(text, sourceId, store) {
 
   // Pending hole-override confirmation (ยืนยัน/ยกเลิก after re-submitting a complete hole)
   if (_og?.pending_override) {
-    const trimmed = raw.trim();
+    const trimmed = said;
     // No \b here: Thai letters are not word characters, so a boundary anchor
     // never matches after "ยืนยัน" and "ยืนยันครับ" fell through to the generic
     // help text while the edit stayed armed.
@@ -707,7 +740,7 @@ export function dispatch(text, sourceId, store) {
 
   // Pending par correction (ยืนยัน/ยกเลิก after "แก้พาร์" on a round in progress)
   if (_og?.pending_par_edit && !_og.pending_override) {
-    const trimmed = raw.trim();
+    const trimmed = said;
     if (/^(ยืนยัน|ตกลง|โอเค|ใช่)/.test(trimmed) || /^(ok|okay|yes|y)$/i.test(trimmed)) {
       const { holes } = _og.pending_par_edit;
       _og.pending_par_edit = null;
@@ -748,25 +781,33 @@ export function dispatch(text, sourceId, store) {
     }
   }
 
-  // Holes 10-18 typed at the turn, waiting for ยืนยัน / แก้ไข — the same check
-  // holes 1-9 get in the setup Q&A. Only a clear yes / no is taken here:
-  // anything else (a corrected nine, a score, chatter) is handled as usual.
-  if (_og?.pending_back9 && !_og.pending_override && !_og.pending_par_edit && intent !== "edit_par") {
-    const t = normalize(raw);
-    const yes = /^(ยืนยัน|ตกลง|โอเค|ใช่|ถูกต้อง)/.test(t) || /^(ok|okay|yes|y)$/i.test(t);
-    const no = /^(แก้ไข|กรอกใหม่|ไม่ถูก|ไม่ใช่|ยกเลิก)/.test(t) || /^(no|n)$/i.test(t);
+  // A nine typed outside the setup Q&A, waiting for ยืนยัน / แก้ไข — holes 1-9
+  // (the Q&A had closed) or holes 10-18 (at the turn). The same check the setup
+  // gives holes 1-9. Only a clear yes / no is taken here: anything else (a
+  // corrected nine, a score, chatter) is handled as usual and leaves it waiting.
+  const held = heldNine(_og);
+  if (held && !_og.pending_override && !_og.pending_par_edit && intent !== "edit_par") {
+    const yes = /^(ยืนยัน|ตกลง|โอเค|ใช่|ถูกต้อง)/.test(said) || /^(ok|okay|yes|y)$/i.test(said);
+    const no = /^(แก้ไข|กรอกใหม่|ไม่ถูก|ไม่ใช่|ยกเลิก)/.test(said) || /^(no|n)$/i.test(said);
     if (yes || no) {
       _og.awaiting_handicap_ack = false; // this reply answered the pars, not the table
       const env = emptyEnvelope();
       env.action = "set_course_par";
       env.room_code = _og.room_code;
+      const front = held.first === 1;
       if (no) {
-        const r = store.dropPendingBackNine(sourceId);
-        env.summary = { ok: true, nine: "back", message: `ได้ครับ กรอกใหม่\n${parPrompt(r.game)}` };
+        const r = front ? store.dropPendingFrontNine(sourceId) : store.dropPendingBackNine(sourceId);
+        env.summary = {
+          ok: true,
+          nine: front ? "front" : "back",
+          message: `ได้ครับ กรอกใหม่\n${parPrompt(r.game)}`,
+        };
         return env;
       }
-      const scoredBack = Object.keys(_og.holes || {}).some((h) => Number(h) >= 10);
-      const r = store.confirmBackNine(sourceId);
+      const scored = Object.keys(_og.holes || {})
+        .map(Number)
+        .some((h) => (front ? h <= 9 : h >= 10));
+      const r = front ? store.confirmFrontNine(sourceId) : store.confirmBackNine(sourceId);
       if (!r.ok) {
         env.summary = { ok: false, message: `พาร์ไม่ถูกต้อง — ต้องเป็นเลข 3–6 ครบ 9 หลุมครับ` };
         return env;
@@ -774,10 +815,10 @@ export function dispatch(text, sourceId, store) {
       env.course = r.game.course;
       env.summary = {
         ok: true,
-        nine: "back",
+        nine: front ? "front" : "back",
         confirmed: true,
         total_par: r.game.course.total_par,
-        message: backNineSavedMessage(r.game, r.back_total, scoredBack),
+        message: heldNineSavedMessage(r.game, held.first, held.total, scored, store),
       };
       return env;
     }
@@ -787,8 +828,12 @@ export function dispatch(text, sourceId, store) {
   // Skipped while a course confirmation is pending so "ยืนยัน" is never stolen.
   if (_og?.awaiting_handicap_ack && !_og.pending_course) {
     _og.awaiting_handicap_ack = false;
-    store.save(_og);
-    if (/^\s*(ตกลง|ตกลงครับ|ตกลงค่ะ|โอเค|โอเคครับ|okay|ok|ใช่|yes|y)\s*$/i.test(raw)) {
+    const ack = /^\s*(ตกลง|ตกลงครับ|ตกลงค่ะ|โอเค|โอเคครับ|okay|ok|ใช่|yes|y)\s*$/i.test(said);
+    // Only an ack is activity. Anything else just clears the flag: saving it the
+    // normal way renewed the 12h window on the first chatter after a table.
+    if (ack) store.save(_og);
+    else store.saveQuiet(_og);
+    if (ack) {
       const env = emptyEnvelope();
       env.action = "handicap_ack";
       env.room_code = _og.room_code;
@@ -859,27 +904,34 @@ export function dispatch(text, sourceId, store) {
     if (hole == null) {
       env.summary = {
         ok: false,
-        message: g.course
-          ? `${parCardMessage(g)}\n\nแก้ทีละหลุมครับ ${fixEg}`
-          : `ยังไม่มีพาร์สนามให้แก้ครับ\n${parPrompt(g)}`,
+        message:
+          g.course || g.pending_front9
+            ? `${parCardMessage(g)}\n\nแก้ทีละหลุมครับ ${fixEg}`
+            : `ยังไม่มีพาร์สนามให้แก้ครับ\n${parPrompt(g)}`,
       };
       return env;
     }
     if (!isValidHoleNumber(hole) || !(par >= 3 && par <= 6)) return badHole();
     // A hole whose par has not been typed yet (no card, or the back nine before
     // the turn) has nothing to correct.
-    if (g.pending_back9 && hole >= 10) {
-      const pars = g.pending_back9.pars.slice();
-      const was = pars[hole - 10];
-      pars[hole - 10] = par;
-      const r = store.setPendingBackNine(sourceId, pars);
+    // A nine waiting for ยืนยัน (held outside the setup): fix it in place and
+    // ask again — nothing has been paid on it yet.
+    const heldEdit = heldNine(g);
+    if (heldEdit && hole >= heldEdit.first && hole <= heldEdit.first + 8) {
+      const pars = heldEdit.pars.slice();
+      const was = pars[hole - heldEdit.first];
+      pars[hole - heldEdit.first] = par;
+      const r =
+        heldEdit.first === 1
+          ? store.holdFrontNine(sourceId, pars)
+          : store.setPendingBackNine(sourceId, pars);
       env.summary = {
         ok: true,
         changed: was !== par,
         pending: true,
         message:
           (was !== par ? `แก้แล้ว ✅\nหลุม ${hole}: ${was} → ${par}` : `พาร์ตรงกับที่กรอกไว้อยู่แล้วครับ 👍`) +
-          `\n\n${backNineConfirmMessage(r.game)}`,
+          `\n\n${heldNineConfirmMessage(r.game)}`,
       };
       return env;
     }
@@ -977,7 +1029,7 @@ export function dispatch(text, sourceId, store) {
   }
 
   // Cancel a game that is mid-setup.
-  if (/^\s*(ยกเลิก|cancel)\s*$/i.test(raw) && store.pendingSetup(sourceId)) {
+  if (/^\s*(ยกเลิก|cancel)\s*$/i.test(said) && store.pendingSetup(sourceId)) {
     store.cancelGame(sourceId);
     const env = emptyEnvelope();
     env.action = "cancel";
@@ -1034,41 +1086,9 @@ export function dispatch(text, sourceId, store) {
   ) {
     return handleSetupAnswer(raw, sourceId, store, pending);
   }
-  // Real gameplay (join / score) closes the guided Q&A — the group has clearly
-  // moved on. It used to close SILENTLY, so stake and pars stayed null, the bot
-  // never asked again, and the round ended with "ทุกคน 0" presented as a real
-  // settlement. Now whatever is still unset is named out loud, and it can be
-  // set at any time afterwards ("หลุมละ 20", "กติกา หัวกินหาง").
+  // Real gameplay (a join or a score that was actually accepted) closes the
+  // guided Q&A — see closeSetupForPlay. Its note is appended to that reply.
   let setupClosingNote = "";
-  if (pending && (intent === "join" || intent === "hole_scores" || bulkFromKnownPlayer)) {
-    const notes = [];
-    // The whole card was typed and shown; only the "ยืนยัน" is missing. Dropping
-    // it would make someone type all 18 pars again — use it, and say how to fix it.
-    if (!pending.course && pending.pending_course) {
-      const c = store.confirmCourse(sourceId);
-      if (c.ok) {
-        const nine = knownHoles(c.game) === 9;
-        notes.push(
-          `✅ ใช้พาร์${nine ? " 9 หลุมแรก" : ""}ที่กรอกไว้ (${nine ? "OUT" : "รวม"} ${c.total})` +
-            ` — ถ้าผิด พิมพ์ "แก้พาร์ หลุม 3 เป็น 5"`
-        );
-      }
-    }
-    const missing = [];
-    // Only holes 1-9 belong to the setup; holes 10-18 are asked for at the turn.
-    if (!pending.course) missing.push(`พาร์สนาม — ${parPrompt(pending)}`);
-    if (pending.stake == null) missing.push('เงินเดิมพัน — พิมพ์ "หลุมละ 20"');
-    if (pending.turbo == null) store.setTurbo(sourceId, false);
-    if (!pending.format) store.setFormat(sourceId, "all_vs_all");
-    store.finishSetup(sourceId);
-    if (missing.length) {
-      notes.push(
-        `⚠️ ยังไม่ได้ตั้ง: ${missing.join(" · ")}\n` +
-          `ตั้งเมื่อไรก็ได้ครับ — ถ้าไม่ตั้งเงินเดิมพัน รอบนี้จะไม่คิดเงิน`
-      );
-    }
-    if (notes.length) setupClosingNote = `\n\n${notes.join("\n")}`;
-  }
 
   // Set the stake / rules after setup has closed. Both change how EVERY hole
   // settles, so they are refused once scores exist rather than silently
@@ -1082,7 +1102,10 @@ export function dispatch(text, sourceId, store) {
       return env;
     }
     const played = Object.keys(g.holes || {}).length;
-    if (played > 0) {
+    // Only money the group has already been told is protected. With no stake
+    // set yet nothing has been announced, so the stake (and the rule) can still
+    // be set — the early-join note promises "ตั้งเมื่อไรก็ได้".
+    if (played > 0 && g.stake) {
       env.summary = {
         ok: false,
         message:
@@ -1109,7 +1132,18 @@ export function dispatch(text, sourceId, store) {
       }
       store.setStake(sourceId, amount);
       keepSetupState();
-      env.summary = { ok: true, stake: amount, message: `หลุมละ ${amount} ✅` };
+      const priced = played > 0 && settleGame(g).perHole.some((h) => Object.values(h.results).some((v) => v));
+      env.summary = {
+        ok: true,
+        stake: amount,
+        message:
+          `หลุมละ ${amount} ✅` +
+          (played > 0
+            ? priced
+              ? `\n💰 คิดเงิน ${played} หลุมที่ลงไปแล้วให้แล้ว — พิมพ์ "ยอดล่าสุด" ดูยอด`
+              : `\nหลุมที่ลงไปแล้ว ${played} หลุมคิดเงินด้วยเดิมพันนี้`
+            : ""),
+      };
       return env;
     }
     const format = parseFormat(raw);
@@ -1168,7 +1202,20 @@ export function dispatch(text, sourceId, store) {
       env.summary = { ok: false, message: "ไม่มีเกมที่กำลังเล่นอยู่ในกลุ่มนี้" };
       return env;
     }
-    const backNote = useTypedBackNine(store, sourceId);
+    // Typed pars still waiting for ยืนยัน: ending now would close the round with
+    // those holes unpaid, for good. Ask first; "แก้ไข" drops them if they were junk.
+    const heldAtEnd = heldNine(g);
+    if (heldAtEnd) {
+      env.summary = {
+        ok: false,
+        pending: true,
+        message:
+          `ยังไม่ได้ยืนยันพาร์ 9 หลุม${heldAtEnd.first === 1 ? "แรก" : "หลัง"}ครับ\n` +
+          `${nineLine(heldAtEnd.pars, heldAtEnd.first)}\n` +
+          `พิมพ์ "ยืนยัน" ถ้าถูกต้อง (หรือ "แก้ไข") แล้วพิมพ์ "จบเกม" อีกครั้ง`,
+      };
+      return env;
+    }
     const names = g.players.map((p) => p.name).join(", ") || "—";
     const holesPlayed = Object.keys(g.holes).length;
     const s = settleGame(g);
@@ -1177,7 +1224,7 @@ export function dispatch(text, sourceId, store) {
       : !g.stake
         ? "\n(รอบนี้ไม่ได้ตั้งเงินเดิมพัน จึงไม่มีเงินให้สรุป)"
         : `\n💰 สรุปเงิน: ${fmtMoney(s.perPlayer)}\n(บวก = ได้ / ลบ = จ่าย)` +
-          (backNineWarning(g) ? `\n⚠️ หลุม 10-18 ไม่ได้คิดเงิน — ไม่ได้กรอกพาร์ 9 หลุมหลัง` : "");
+          (missingParsWarning(g) ? `\n⚠️ หลุมที่ไม่มีพาร์ไม่ได้คิดเงิน` : "");
     env.players = g.players;
     env.summary = {
       ok: true,
@@ -1187,7 +1234,6 @@ export function dispatch(text, sourceId, store) {
       holes_played: holesPlayed,
       per_player: s.perPlayer,
       message:
-        (backNote ? `${backNote}\n\n` : "") +
         `จบเกมแล้ว ✅\n` +
         (g.course_name ? `สนาม ${g.course_name} · ` : "") +
         `ผู้เล่น: ${names} · เล่นไปแล้ว ${holesPlayed}/18 หลุม` +
@@ -1257,12 +1303,14 @@ export function dispatch(text, sourceId, store) {
       };
       return env;
     }
+    setupClosingNote = closeSetupForPlay(sourceId, store);
     const g = r.game;
     env.players = g.players;
     env.handicap_level = g.handicap_level;
     env.rules = g.rules;
     const count = g.players.length;
-    const cap = g.expected_players ? `/${g.expected_players}` : "";
+    // "3/2 คน" when more people join than the game was made for: show the count only.
+    const cap = g.expected_players && count <= g.expected_players ? `/${g.expected_players}` : "";
     const stillSettingUp = store.pendingSetup(sourceId);
     env.summary = {
       ok: true,
@@ -1396,10 +1444,6 @@ export function dispatch(text, sourceId, store) {
       }
     }
 
-    // A back-nine hole is being scored: holes 10-18 that are still waiting for
-    // ยืนยัน are used now, so this hole is netted and paid like any other.
-    const backNote = parsed.hole >= 10 ? useTypedBackNine(store, sourceId) : "";
-    if (backNote) setupClosingNote = `\n\n${backNote}${setupClosingNote}`;
     const r = store.recordHole(sourceId, parsed);
     if (!r.ok) {
       env.summary = {
@@ -1413,6 +1457,7 @@ export function dispatch(text, sourceId, store) {
       };
       return env;
     }
+    setupClosingNote = closeSetupForPlay(sourceId, store); // the score was accepted
     const game = r.game;
     const hole = r.hole;
     const rows = game.holes[hole] || [];
@@ -1452,6 +1497,10 @@ export function dispatch(text, sourceId, store) {
       const ctx = holeMatrix ? { par: r.par, matrix: holeMatrix } : null;
       holeMoney = settleFn(rows, stakeHole, ctx);
       moneyLine = `\n💰 หลุมนี้ (หลุมละ ${stakeHole}): ${fmtMoney(holeMoney)}`;
+    } else if (!game.stake) {
+      // Without this the hole just ends with no money line and nobody notices
+      // until the end that the whole round was played for nothing.
+      moneyLine = `\n⚠️ ยังไม่ได้ตั้งเงินเดิมพัน — ยังไม่คิดเงิน · พิมพ์ "หลุมละ 20"`;
     }
     // advance the round pointer + announce the next hole
     let nextLine = "";
@@ -1504,11 +1553,13 @@ export function dispatch(text, sourceId, store) {
       }
     }
     // The back nine's pars are asked for at the turn — after the front-nine
-    // money is in — and every back-nine hole played without them says so.
+    // money is in — and any hole completed without its par says so (and what
+    // to type), instead of quietly settling as nothing.
     let parAsk = "";
-    if (knownHoles(game) === 9) {
-      if (hole === 9) parAsk = `\n\n⛳ จบ 9 หลุมแรก — ${parPrompt(game)}`;
-      else if (hole >= 10) parAsk = `\n\n${backNineWarning(game)}`;
+    if (hole === 9 && knownHoles(game) === 9) {
+      parAsk = `\n\n⛳ จบ 9 หลุมแรก — ${parPrompt(game)}`;
+    } else if (r.par == null && missingParsWarning(game)) {
+      parAsk = `\n\n${missingParsWarning(game)}`;
     }
     env.summary = {
       ok: true,
@@ -1638,7 +1689,6 @@ export function dispatch(text, sourceId, store) {
       return env;
     }
     store.save(g); // asking for the money is real activity — renew the 12h window
-    const backNote = useTypedBackNine(store, sourceId);
     const s = settleGame(g);
     // Snapshot to history now: plenty of groups settle with "รวม 18" and then
     // just stop typing, so this may be the last time the round is ever seen.
@@ -1650,18 +1700,18 @@ export function dispatch(text, sourceId, store) {
       ok: true,
       holes_counted: s.holesCounted,
       per_player: s.perPlayer,
-      message: (backNote ? `${backNote}\n\n` : "") + (!s.holesCounted
+      message: !s.holesCounted
         ? "ยังไม่มีสกอร์ที่บันทึก — ลงแต้มก่อนนะครับ"
         : !g.stake
           ? // Printing "ทุกคน 0" as a settlement made a round with no stake look
             // like everyone had broken even. Say what actually happened.
-            `รอบนี้ไม่ได้ตั้งเงินเดิมพัน จึงไม่มีเงินให้สรุปครับ ` +
+            `ยังไม่ได้ตั้งเงินเดิมพัน จึงยังไม่มีเงินให้สรุปครับ ` +
             `(เล่นไปแล้ว ${s.holesCounted}/18 หลุม)\n` +
-            `ตั้งก่อนออกรอบครั้งหน้าด้วย "หลุมละ 20"\n` +
+            `พิมพ์ "หลุมละ 20" แล้วบอทจะคิดเงินทุกหลุมที่ลงไปแล้วให้\n` +
             `📒 ห้อง ${g.room_code} — ดูสกอร์ย้อนหลังได้ด้วย "ประวัติ ${g.room_code}"`
           : `สรุปเงินรวม 💰 (เล่นไปแล้ว ${s.holesCounted}/18 หลุม)\n${fmtMoney(s.perPlayer)}\n(บวก = ได้ / ลบ = จ่าย)\n` +
-            (backNineWarning(g) ? `${backNineWarning(g)}\n` : "") +
-            `📒 ห้อง ${g.room_code} — ดูย้อนหลังได้ด้วย "ประวัติ ${g.room_code}"`),
+            (missingParsWarning(g) ? `${missingParsWarning(g)}\n` : "") +
+            `📒 ห้อง ${g.room_code} — ดูย้อนหลังได้ด้วย "ประวัติ ${g.room_code}"`,
     };
     return env;
   }
@@ -1699,19 +1749,20 @@ export function dispatch(text, sourceId, store) {
         return env;
       }
     }
-    const backNote = useTypedBackNine(store, sourceId); // a full card covers holes 10-18
     const r = store.recordBulk(sourceId, bulkName, parsed.scores);
     if (!r.ok) {
       env.summary = { ok: false, message: `ยังไม่มีเกมในกลุ่มนี้ — พิมพ์ "สร้างเกม" ก่อน` };
       return env;
     }
+    const closing = closeSetupForPlay(sourceId, store);
+    const warn = missingParsWarning(r.game);
     env.summary = {
       ok: true,
       player: bulkName,
       message:
-        (backNote ? `${backNote}\n\n` : "") +
         `รับสกอร์ ${bulkName} ครบ 18 หลุมแล้ว ✅\nครบทุกคนแล้วพิมพ์ "รวม 18" เพื่อสรุปเงิน` +
-        (backNineWarning(r.game) ? `\n\n${backNineWarning(r.game)}` : ""),
+        closing +
+        (warn ? `\n\n${warn}` : ""),
     };
     return env;
   }
@@ -1727,6 +1778,46 @@ export function dispatch(text, sourceId, store) {
       `"หลุม 1 A 5 B 6", "สถานะ" หรือ "ดูพาร์"`,
   };
   return env;
+}
+
+/**
+ * Real gameplay closes the guided Q&A — the group has clearly moved on. Called
+ * only AFTER a join or a score was actually accepted: a join that failed (a
+ * typo'd room code, pars pasted with a quote mark) used to close it silently,
+ * and the bot never asked for ยืนยัน, the stake, turbo or กติกา again.
+ * Whatever is still unset is named out loud; it can be set at any time
+ * afterwards ("หลุมละ 20", "กติกา หัวกินหาง"). Typed holes 1-9 that were still
+ * waiting for ยืนยัน keep waiting — they are never used without it.
+ * @returns {string} note to append to the reply ("" when no Q&A was open)
+ */
+function closeSetupForPlay(sourceId, store) {
+  const pending = store.pendingSetup(sourceId);
+  if (!pending) return "";
+  const notes = [];
+  if (!pending.course && pending.pending_course) {
+    if (pending.pending_course.holes.length === 9) {
+      store.holdFrontNine(sourceId, parsOf(pending.pending_course.holes));
+    } else {
+      // A whole 18-hole card typed before pars went in nine at a time (a round
+      // restored from the old version): it was shown in full — use it.
+      const c = store.confirmCourse(sourceId);
+      if (c.ok) notes.push(`✅ ใช้พาร์ที่กรอกไว้ (รวม ${c.total}) — ถ้าผิด พิมพ์ "แก้พาร์ หลุม 3 เป็น 5"`);
+    }
+  }
+  const missing = [];
+  // Only holes 1-9 belong to the setup; holes 10-18 are asked for at the turn.
+  if (!pending.course) missing.push(`พาร์สนาม — ${parPrompt(pending)}`);
+  if (pending.stake == null) missing.push('เงินเดิมพัน — พิมพ์ "หลุมละ 20"');
+  if (pending.turbo == null) store.setTurbo(sourceId, false);
+  if (!pending.format) store.setFormat(sourceId, "all_vs_all");
+  store.finishSetup(sourceId);
+  if (missing.length) {
+    notes.push(
+      `⚠️ ยังไม่ได้ตั้ง: ${missing.join(" · ")}\n` +
+        `ตั้งเมื่อไรก็ได้ครับ — ถ้าไม่ตั้งเงินเดิมพัน รอบนี้จะไม่คิดเงิน`
+    );
+  }
+  return notes.length ? `\n\n${notes.join("\n")}` : "";
 }
 
 /** "กรอกทีละ 9 หลุม" — the reply to a whole 18-digit card, which is never taken. */
@@ -1783,19 +1874,17 @@ function parCardEntry(raw, sourceId, store) {
     );
   }
 
-  // Holes 1-9 (the setup closed before they were typed).
+  // Holes 1-9 (the setup closed before they were typed): shown once for
+  // "ยืนยัน" before they count, like everywhere else. Typed again = replaced.
   if (known === 0) {
-    const r = store.setFrontNine(sourceId, nine.pars);
+    const r = store.holdFrontNine(sourceId, nine.pars);
     if (!r.ok) return fail(`พาร์ไม่ถูกต้อง — ต้องเป็นเลข 3–6 ครบ 9 หลุมครับ`);
-    env.course = r.game.course;
     env.summary = {
       ok: true,
       nine: "front",
+      pending: true,
       out: nine.total,
-      message:
-        `${nineLine(nine.pars)} ✅\n` +
-        `ถ้าผิด พิมพ์ "แก้พาร์ หลุม 3 เป็น 5" · 9 หลุมหลังบอทจะถามตอนจบหลุม 9` +
-        (asking ? tail : maybeStartRound(r.game, store)),
+      message: heldNineConfirmMessage(r.game) + tail,
     };
     return env;
   }
@@ -1810,7 +1899,7 @@ function parCardEntry(raw, sourceId, store) {
     pending: true,
     in: nine.total,
     total_par: r.game.course.total_par + nine.total,
-    message: backNineConfirmMessage(r.game) + tail,
+    message: heldNineConfirmMessage(r.game) + tail,
   };
   return env;
 }
@@ -1864,6 +1953,10 @@ function parSetupAnswer(t, sourceId, store, game, env) {
       env.summary = { ok: false, step, message: `ได้ครับ\n${parPrompt(game)}` };
       return env;
     }
+    if (/^(ยืนยัน|ตกลง|โอเค|ใช่|ok|yes)/i.test(t)) {
+      env.summary = { ok: false, step, message: `ยังไม่มีพาร์ให้ยืนยันครับ\n${parPrompt(game)}` };
+      return env;
+    }
     // Words, not pars — most likely a course name typed out of habit.
     env.summary = {
       ok: false,
@@ -1894,6 +1987,27 @@ function parSetupAnswer(t, sourceId, store, game, env) {
 
 /** Guided game setup: consume the next free-text reply as
  *  holes 1-9 -> ยืนยัน -> stake -> turbo -> กติกา. */
+// The guided questions are answered in a group where people keep chatting, so
+// an answer must BE the answer — not merely contain it. Matching anywhere took
+// "555" (laughter) as หลุมละ 555, "16.52" (a time) as หลุมละ 16, "มีใครไปบ้าง"
+// as turbo on and "ทุกคนพร้อมยัง" as กินกันทุกคน. Polite endings still count:
+// "มีครับ", "100 บาทค่ะ", "เลือก 1".
+const POLITE_TAIL_RE = /(?:ครับผม|ครับ|คับ|ขรับ|ฮะ|ฮับ|ค่ะ|คะ|ค่า|จ้า|จ้ะ|จ๊ะ|นะ|น้า|เลย|ด้วย)+$/u;
+function bareAnswer(text) {
+  return normalize(text)
+    .toLowerCase()
+    .replace(/[\s!?.,~:：()\-]+/g, "")
+    .replace(POLITE_TAIL_RE, "");
+}
+const TURBO_YES_RE = /^(?:มี|มีเทอร์โบ|เอา|เอาเทอร์โบ|ใช่|เปิด|เปิดเทอร์โบ|yes|y|turbo|เทอร์โบ|มีturbo)$/u;
+const TURBO_NO_RE = /^(?:ไม่มี|ไม่|ไม่เอา|ไม่ต้อง|ปิด|no|n|ไม่มีเทอร์โบ|ไม่เอาเทอร์โบ|ไม่มีturbo)$/u;
+const FORMAT_PREFIX_RE = /^(?:กติกา|เลือก|ข้อ|แบบ)/u;
+const HEAD_TAIL_RE = /^(?:1|1️⃣|หัวกินหาง|headtail|headeatstail)$/u;
+const ALL_VS_ALL_RE = /^(?:2|2️⃣|กินกันทุกคน|กินทุกคน|ทุกคน|allvsall)$/u;
+/** The stake as a whole answer: "100", "1,000", "หลุมละ 50 บาท", "20 ครับ". */
+const STAKE_ANSWER_RE =
+  /^(?:(?:หลุมละ|เดิมพัน|เงินเดิมพัน|stake)\s*[:：]?\s*)?(?:฿\s*)?(\d+)\s*(?:บาท|฿|baht)?\s*(?:ครับผม|ครับ|คับ|ค่ะ|คะ|ค่า|จ้า|จ้ะ|นะ)?$/iu;
+
 function handleSetupAnswer(text, sourceId, store, game) {
   const env = emptyEnvelope();
   env.action = "game_setup";
@@ -1971,7 +2085,18 @@ function handleSetupAnswer(text, sourceId, store, game) {
       return env;
     }
     // "หลุมละ 1,000 บาท" must be 1000, not 1 — the first \d+ used to win.
-    const amount = parseStake(t);
+    const said = normalize(t).replace(/(\d),(?=\d{3}\b)/g, "$1");
+    const m = said.match(STAKE_ANSWER_RE);
+    const amount = m ? Number(m[1]) : null;
+    // A bare 555 / 5555 is laughter, not a stake — unless it says so.
+    if (amount && /^5{3,}$/.test(said)) {
+      env.summary = {
+        ok: false,
+        step: "stake",
+        message: `เล่นกันหลุมละเท่าไรครับ? (พิมพ์ตัวเลข เช่น 20)\nถ้าหลุมละ ${said} จริง ๆ พิมพ์ "หลุมละ ${said}"`,
+      };
+      return env;
+    }
     if (!amount || amount < 0) {
       env.summary = { ok: false, step: "stake", message: "พิมพ์เป็นตัวเลขครับ เช่น 20 (หลุมละกี่บาท)" };
       return env;
@@ -1987,8 +2112,9 @@ function handleSetupAnswer(text, sourceId, store, game) {
   }
 
   if (game.setup === 'turbo') {
-    const no = /ไม่มี|ไม่|\bno\b|^n$/i.test(t);
-    const yes = !no && /มี|ใช่|\byes\b|^y$|turbo|เทอร์โบ/i.test(t);
+    const b = bareAnswer(t);
+    const no = TURBO_NO_RE.test(b);
+    const yes = !no && TURBO_YES_RE.test(b);
     if (!yes && !no) {
       env.summary = { ok: false, step: 'turbo', message: 'ตอบ "มี" หรือ "ไม่มี" ครับ' };
       return env;
@@ -2014,8 +2140,9 @@ function handleSetupAnswer(text, sourceId, store, game) {
 
   if (game.setup === 'format') {
     // 1 = หัวกินหาง, 2 = กินกันทุกคน (menu order — keep in sync with the prompt above)
-    const isHeadTail = /^1$|หัวกินหาง/i.test(t);
-    const isAllVsAll = /^2$|กินกันทุกคน/i.test(t);
+    const b = bareAnswer(t).replace(FORMAT_PREFIX_RE, "");
+    const isHeadTail = HEAD_TAIL_RE.test(b);
+    const isAllVsAll = ALL_VS_ALL_RE.test(b);
     if (!isAllVsAll && !isHeadTail) {
       env.summary = {
         ok: false,

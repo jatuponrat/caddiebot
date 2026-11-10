@@ -4,11 +4,21 @@
 
 const THAI_DIGITS = "๐๑๒๓๔๕๖๗๘๙";
 
-/** Lowercase-safe normalize: Thai digits -> Arabic, collapse whitespace, trim. */
+/**
+ * Quote marks. People copy an example straight out of the bot's own message —
+ * `454354434"` or “ยืนยัน” — and the quotes come along. A quote is never part of
+ * a command, a name, a score or a par, so they are dropped before parsing.
+ */
+const QUOTES_RE = /["'`“”‘’„‟«»‹›「」『』]/g;
+
+/** Lowercase-safe normalize: Thai digits -> Arabic, quote marks dropped,
+ *  whitespace collapsed, trimmed. */
 export function normalize(text) {
   if (text == null) return "";
   return String(text)
     .replace(/[๐-๙]/g, (d) => String(THAI_DIGITS.indexOf(d)))
+    .replace(/[０-９]/g, (d) => String(d.charCodeAt(0) - 0xff10)) // full-width keyboards
+    .replace(QUOTES_RE, "")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -22,7 +32,9 @@ const HOLE_LINE_RE = /(?:(?:หลุม|hole|รู)\s*\d)|(?:^h\s*\d{1,2}\b)/i
  */
 export function detectIntent(text) {
   const raw = String(text ?? "");
-  if (/^\s*[\[{]/.test(raw)) return "course_json"; // pasted JSON course
+  // Pasted JSON course — never a bare par card in brackets ("[454354434]"):
+  // real course JSON always carries words ("holes", "par").
+  if (/^\s*[\[{]/.test(raw) && !parDigitsOnly(raw)) return "course_json";
   const t = normalize(raw);
 
   // "แก้พาร์ …" — correct a card that was saved wrong. Checked FIRST: the
@@ -92,11 +104,15 @@ export function detectIntent(text) {
   const compact = noKw.replace(/\s+/g, "");
   if (noKw.length !== t.length && /\d/.test(compact)) return "par_string"; // explicit keyword
   if (/^\d{16,20}$/.test(compact)) return "par_string"; // bare ~18-digit par card
-  // Nine holes of par ("454354434"), typed one nine at a time. Checked before
+  // Nine holes of par ("454354434"), typed one nine at a time — with whatever
+  // punctuation came along (brackets, a full stop, an emoji). Checked before
   // the room-code join fallback below, which would otherwise read it as a
   // 9-digit room code. No real room code can match: its month (01-12) always
   // carries a 0, 1 or 2, and a par is 3-6.
-  if (/^[3-6]{9}$/.test(compact)) return "par_string";
+  const parOnly = parDigitsOnly(raw);
+  if (parOnly && (/^[3-6]{9}$/.test(parOnly) || (parOnly.length >= 16 && parOnly.length <= 20))) {
+    return "par_string";
+  }
   // Bulk per-player card: "แซม 544535445 445354454" (name + 18 single-digit holes).
   // The name may be several words ("สมชาย ใจดี 445345434 453443544"). With a
   // single-token name required here, such a card fell through to the join
@@ -105,10 +121,13 @@ export function detectIntent(text) {
   if (/^\D\S*(?:\s+\D\S*)*\s+\d{9}\s+\d{9}$/.test(t) || /^\D\S*(?:\s+\D\S*)*\s+\d{18}$/.test(t)) {
     return "bulk_scores";
   }
-  // Fallback: a room code (9-digit date code or legacy 4-digit) plus several
-  // scores reads like a join, even without the "เข้าร่วม" keyword.
-  if (/\b\d{9}\b/.test(t) && (t.match(/\d{2,3}/g) || []).length >= 3) return "join";
-  if (/\b\d{4}\b/.test(t) && (t.match(/\d{2,3}/g) || []).length >= 4) return "join";
+  // Fallback: a room code (9-digit date code or legacy 4-digit) plus a name and
+  // scores reads like a join, even without the "เข้าร่วม" keyword. Never a bare
+  // number with no name in it: "454354434" (pars) or a phone number used to be
+  // read as a room code and answered "ไม่พบห้อง".
+  const hasName = /[A-Za-z\u0E00-\u0E7F]/.test(t);
+  if (hasName && /\b\d{9}\b/.test(t) && (t.match(/\d{2,3}/g) || []).length >= 3) return "join";
+  if (hasName && /\b\d{4}\b/.test(t) && (t.match(/\d{2,3}/g) || []).length >= 4) return "join";
   return "unknown";
 }
 
@@ -302,8 +321,9 @@ export function parseHoleScores(text) {
   };
 }
 
-/** "พาร์ 454354434" — the keyword in front of a par card is optional. */
-const PAR_KEYWORD_RE = /^(พาร์|par|สนาม|course)\s*[:：]?\s*/i;
+/** "พาร์ 454354434" / "เช่น 454354434" — a word in front of a par card is
+ *  optional ("เช่น" comes along when the bot's example is copied whole). */
+const PAR_KEYWORD_RE = /^(?:(?:เช่น|พาร์|par|สนาม|course)\s*[:：]?\s*)+/i;
 
 /**
  * Course par card entered as 18 par digits, e.g. "454354434 443535444" (9+9),
@@ -339,13 +359,14 @@ export function parseParNine(text) {
 
 /**
  * The digits of a message that is NOTHING BUT a par card — "454354434",
- * "4 5 4 3 5 4 4 3 4", "4-5-4-3-5-4-4-3-4", "พาร์ 454354434 443535444".
- * Returns null as soon as the message carries anything else (a name, a word),
- * so a score card or a join can never be mistaken for pars.
+ * "4 5 4 3 5 4 4 3 4", "4-5-4-3-5-4-4-3-4", "(454354434)", "พาร์ 454354434".
+ * Punctuation, quotes and emoji around the digits are ignored; a single letter
+ * (Thai or Latin) anywhere means it is not a par card, so a score card, a join
+ * or a sentence can never be mistaken for pars.
  */
 export function parDigitsOnly(text) {
   const t = normalize(text).replace(PAR_KEYWORD_RE, "");
-  if (!t || !/^[\d\s,.\-/]+$/.test(t)) return null;
+  if (!t || /[A-Za-z\u0E00-\u0E7F]/.test(t)) return null;
   const digits = t.replace(/\D/g, "");
   return digits || null;
 }
