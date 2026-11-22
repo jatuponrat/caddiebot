@@ -31,6 +31,7 @@ import {
   classifyHandicapLevel,
   formatRoomCodeDate,
   normalizeRoomCode,
+  parseRoomCode,
   formatThaiDateTime,
   matchPlayerName,
   matrixForHole,
@@ -246,6 +247,134 @@ export function frontNineCard(game, store) {
     const cells = v.holes.map((g) => (g == null ? "-" : String(g))).join(" ");
     const vsPar = parOut && v.complete ? ` (${v.total - parOut >= 0 ? "+" : ""}${v.total - parOut})` : "";
     lines.push(`${name.padEnd(pad)}  ${cells} = ${v.total}${vsPar}${v.complete ? "" : " ⚠️"}`);
+  }
+  return lines.join("\n");
+}
+
+/** "+7" / "+0" / "-2": strokes against par, printed the way the OUT card does. */
+function vsParLabel(diff) {
+  return `${diff >= 0 ? "+" : ""}${diff}`;
+}
+
+/**
+ * Every hole's score for every player: the card that closes a round. Shown
+ * under the money by "รวม 18" and "จบเกม", and again by "ประวัติ <code>".
+ *
+ *   📋 สกอร์ทุกหลุม
+ *   OUT · หลุม 1-9
+ *   พาร์  4 5 4 3 5 4 4 3 4 = 36
+ *   หมวย  4 5 5 3 5 4 4 4 4 = 38 (+2)
+ *   แซม   5 6 4 4 6 5 5 3 5 = 43 (+7)
+ *
+ *   IN · หลุม 10-18
+ *   …
+ *
+ *   รวม 18 หลุม · พาร์ 72
+ *   หมวย  38 + 37 = 75 (+3)
+ *   แซม   43 + 45 = 88 (+16)
+ *
+ * Gross scores, exactly as typed. A nine is shown once anybody has scored on
+ * it, and only up to the last hole anybody played, so a round that stopped
+ * early is not padded with empty holes. "-" is a hole that player has no number
+ * for (⚠️ on the row, and no "vs par" on a total that is missing holes).
+ * Players are listed best total first, in the same order in every block. Reads
+ * only players / holes / course, so a live game and an archived round both work.
+ */
+export function fullScoreCard(game) {
+  const holes = game?.holes || {};
+  const grossOf = (name, h) => {
+    const row = (Array.isArray(holes[h]) ? holes[h] : []).find((r) => r?.name === name);
+    const g = Number(row?.gross);
+    return row?.gross == null || !Number.isFinite(g) ? null : g;
+  };
+  // The roster, plus any name that only appears on a score line: settleGame
+  // pays those too, so the card has to show where that money came from.
+  // (Archived rows are read back as-is, so anything nameless is skipped.)
+  const isName = (n) => typeof n === "string" && n !== "";
+  const names = [
+    ...new Set((Array.isArray(game?.players) ? game.players : []).map((p) => p?.name).filter(isName)),
+  ];
+  for (let h = MIN_HOLE_NUMBER; h <= MAX_HOLE_NUMBER; h++) {
+    for (const r of Array.isArray(holes[h]) ? holes[h] : []) {
+      if (isName(r?.name) && !names.includes(r.name)) names.push(r.name);
+    }
+  }
+  const nines = [];
+  for (const first of [1, 10]) {
+    let last = 0;
+    for (let h = first; h <= first + 8; h++) {
+      if (names.some((n) => grossOf(n, h) != null)) last = h;
+    }
+    if (!last) continue;
+    nines.push({
+      label: first === 1 ? "OUT" : "IN",
+      first,
+      last,
+      holes: Array.from({ length: last - first + 1 }, (_, i) => first + i),
+    });
+  }
+  if (!nines.length) return "";
+
+  const parMap = new Map(
+    (game?.course?.holes || []).map((x) => [Number(x.hole), Number(x.par)])
+  );
+  const parOf = (h) => (Number.isFinite(parMap.get(h)) ? parMap.get(h) : null);
+  /** Par over these holes, or null when any of them has no par. */
+  const parSum = (hs) =>
+    hs.every((h) => parOf(h) != null) ? hs.reduce((a, h) => a + parOf(h), 0) : null;
+
+  const players = names.map((name, idx) => {
+    const perNine = nines.map((nine) => {
+      const cells = nine.holes.map((h) => grossOf(name, h));
+      const played = cells.filter((g) => g != null);
+      return {
+        cells,
+        total: played.reduce((a, b) => a + b, 0),
+        played: played.length,
+        missing: cells.length - played.length,
+      };
+    });
+    const sum = (k) => perNine.reduce((a, n) => a + n[k], 0);
+    return { name, idx, perNine, total: sum("total"), played: sum("played"), missing: sum("missing") };
+  });
+  // complete cards first, best gross first; the roster order breaks ties
+  players.sort((a, b) => (a.missing > 0) - (b.missing > 0) || a.total - b.total || a.idx - b.idx);
+
+  const pad = Math.max("พาร์".length, ...names.map((n) => n.length));
+  const lines = ["📋 สกอร์ทุกหลุม"];
+  nines.forEach((nine, i) => {
+    const par = parSum(nine.holes);
+    if (i > 0) lines.push("");
+    const span = nine.last > nine.first ? `${nine.first}-${nine.last}` : `${nine.first}`;
+    lines.push(`${nine.label} · หลุม ${span}`);
+    if (par != null) {
+      lines.push(`${"พาร์".padEnd(pad)}  ${nine.holes.map(parOf).join(" ")} = ${par}`);
+    }
+    for (const p of players) {
+      const n = p.perNine[i];
+      const cells = n.cells.map((g) => (g == null ? "-" : String(g))).join(" ");
+      const total = n.played ? ` = ${n.total}` : "";
+      const vsPar = n.played && !n.missing && par != null ? ` (${vsParLabel(n.total - par)})` : "";
+      lines.push(`${p.name.padEnd(pad)}  ${cells}${total}${vsPar}${n.missing ? " ⚠️" : ""}`);
+    }
+  });
+
+  // Both nines played: the round's totals, best first.
+  if (nines.length === 2) {
+    const shown = nines.flatMap((nine) => nine.holes);
+    const par = parSum(shown);
+    lines.push("", `รวม ${shown.length} หลุม${par != null ? ` · พาร์ ${par}` : ""}`);
+    for (const p of players) {
+      const parts = p.perNine.map((n) => (n.played ? String(n.total) : "-")).join(" + ");
+      // nobody scored for this player at all: "= 0" would read like a real total
+      const total = p.played ? ` = ${p.total}` : "";
+      const tail = p.missing
+        ? ` (ขาด ${p.missing} หลุม)`
+        : par != null
+          ? ` (${vsParLabel(p.total - par)})`
+          : "";
+      lines.push(`${p.name.padEnd(pad)}  ${parts}${total}${tail}`);
+    }
   }
   return lines.join("\n");
 }
@@ -630,6 +759,9 @@ const WELCOME_TH =
   `ดูแต้มต่อ: "แต้มต่อ" · ยอดเงินล่าสุด: "ยอดล่าสุด"\n` +
   `สรุปเงิน: "รวม 18" · จบเกม: "จบเกม"`;
 
+/** The old greeting. NOT sent automatically any more (server.js stays silent on
+ *  follow / join / memberJoined — the OA is also the shop's booking chat); kept
+ *  for a help command, should one ever be wanted. */
 export function welcomeMessage() {
   return WELCOME_TH;
 }
@@ -1225,6 +1357,9 @@ export function dispatch(text, sourceId, store) {
         ? "\n(รอบนี้ไม่ได้ตั้งเงินเดิมพัน จึงไม่มีเงินให้สรุป)"
         : `\n💰 สรุปเงิน: ${fmtMoney(s.perPlayer)}\n(บวก = ได้ / ลบ = จ่าย)` +
           (missingParsWarning(g) ? `\n⚠️ หลุมที่ไม่มีพาร์ไม่ได้คิดเงิน` : "");
+    // Every hole's score goes out with the money: once the room closes, this
+    // message is the round's scorecard (and "ประวัติ" shows the same card).
+    const card = fullScoreCard(g);
     env.players = g.players;
     env.summary = {
       ok: true,
@@ -1238,6 +1373,7 @@ export function dispatch(text, sourceId, store) {
         (g.course_name ? `สนาม ${g.course_name} · ` : "") +
         `ผู้เล่น: ${names} · เล่นไปแล้ว ${holesPlayed}/18 หลุม` +
         settleLine +
+        (card ? `\n\n${card}\n` : "") +
         `\n📒 ห้อง ${g.room_code} — ดูย้อนหลังได้ด้วย "ประวัติ ${g.room_code}"`,
     };
     // cancelGame archives the round to `rounds` before wiping the session.
@@ -1694,6 +1830,10 @@ export function dispatch(text, sourceId, store) {
     // just stop typing, so this may be the last time the round is ever seen.
     // Idempotent — "จบเกม" later updates the same row.
     store.archiveGame(g, "settled");
+    // Groups that settle with "รวม 18" and stop typing never see the "จบเกม"
+    // reply, so the scorecard goes out with this money summary too.
+    const card = fullScoreCard(g);
+    const cardBlock = card ? `\n${card}\n\n` : "";
     env.players = g.players;
     env.room_code = g.room_code;
     env.summary = {
@@ -1708,9 +1848,11 @@ export function dispatch(text, sourceId, store) {
             `ยังไม่ได้ตั้งเงินเดิมพัน จึงยังไม่มีเงินให้สรุปครับ ` +
             `(เล่นไปแล้ว ${s.holesCounted}/18 หลุม)\n` +
             `พิมพ์ "หลุมละ 20" แล้วบอทจะคิดเงินทุกหลุมที่ลงไปแล้วให้\n` +
+            cardBlock +
             `📒 ห้อง ${g.room_code} — ดูสกอร์ย้อนหลังได้ด้วย "ประวัติ ${g.room_code}"`
           : `สรุปเงินรวม 💰 (เล่นไปแล้ว ${s.holesCounted}/18 หลุม)\n${fmtMoney(s.perPlayer)}\n(บวก = ได้ / ลบ = จ่าย)\n` +
             (missingParsWarning(g) ? `${missingParsWarning(g)}\n` : "") +
+            cardBlock +
             `📒 ห้อง ${g.room_code} — ดูย้อนหลังได้ด้วย "ประวัติ ${g.room_code}"`,
     };
     return env;
@@ -2204,27 +2346,11 @@ function fmtWhen(ts) {
   return ts ? formatThaiDateTime(ts) : "";
 }
 
-/** Total gross per player across an archived `holes` object. */
-function grossTotals(holes) {
-  const totals = {};
-  for (const rows of Object.values(holes || {})) {
-    for (const row of rows || []) {
-      if (!row?.name) continue;
-      totals[row.name] = totals[row.name] || { gross: 0, played: 0 };
-      if (row.gross == null) continue; // hole never got a number
-      totals[row.name].gross += Number(row.gross);
-      totals[row.name].played++;
-    }
-  }
-  return totals;
-}
-
 function formatRoundDetail(row) {
   const code = row.archive_key || row.room_code;
   const dateLabel = formatRoomCodeDate(code) || fmtWhen(row.created_at);
   const settlement = row.settlement || {};
   const players = Array.isArray(row.players) ? row.players : [];
-  const totals = grossTotals(row.holes);
 
   const head = `📒 ประวัติ ห้อง ${code}${dateLabel ? ` · ${dateLabel}` : ""}`;
   const setup = [
@@ -2244,10 +2370,14 @@ function formatRoundDetail(row) {
     ? `\n💰 สรุปเงิน (เล่นไปแล้ว ${row.holes_counted ?? "-"}/18 หลุม)\n${fmtMoney(settlement)}\n(บวก = ได้ / ลบ = จ่าย)`
     : "\n(รอบนี้ไม่มีสกอร์ที่บันทึกไว้)";
 
-  const cardLines = Object.entries(totals)
-    .sort((a, b) => a[1].gross - b[1].gross)
-    .map(([name, t]) => `${name} ${t.gross} (${t.played} หลุม)`);
-  const cardBlock = cardLines.length ? `\n\n📋 สกอร์รวม\n${cardLines.join("\n")}` : "";
+  // The same every-hole card the round closed with ("รวม 18" / "จบเกม").
+  // Rounds archived before `course` was stored simply show no par row.
+  const card = fullScoreCard({
+    players,
+    holes: row.holes && typeof row.holes === "object" ? row.holes : {},
+    course: row.course && typeof row.course === "object" ? row.course : null,
+  });
+  const cardBlock = card ? `\n\n${card}` : "";
 
   const status = ENDED_REASON_TH[row.ended_reason] || row.ended_reason || "";
   const when = fmtWhen(row.updated_at || row.created_at);
@@ -2275,17 +2405,33 @@ function formatRoundList(rows) {
   );
 }
 
-/** Build the reply for a history request. Always answers — never silent. */
+/**
+ * Build the reply for a history request.
+ *
+ * This is the one command that can answer while the bot is otherwise idle —
+ * but the OA (@swinghouse) is also the shop's booking chat, and customers write
+ * "ขอดูรอบว่างวันเสาร์", "จองย้อนหลังได้ไหม", "ประวัติการจอง" all the time (every
+ * one of them contains a history word). So in a chat with no live game the bot
+ * only answers when there is golf history to show: a round finished in this
+ * chat, or a real dated room code ("ประวัติ 221126001") that exists. Anything
+ * else gets the idle envelope — total silence, like every other idle message.
+ */
 export async function historyReply(text, sourceId, store = null) {
   const env = emptyEnvelope();
   env.action = "history";
   const { code } = parseHistoryQuery(text);
+  const live = store?.activeGame?.(sourceId) || null;
+  const recent = await listRounds(sourceId, 5).catch(() => []);
+  const golfChat = Boolean(live) || recent.length > 0;
 
   if (code) {
     const row = await findRound(normalizeRoomCode(code)).catch(() => null);
+    // Not a golf chat: only an existing, dated room code gets an answer. A time
+    // slot ("ดูรอบ 1900") must never pull up an old 4-digit room, and a typo'd
+    // number must never earn a "ไม่พบประวัติ" reply in a customer's chat.
+    if (!golfChat && !(row && parseRoomCode(code))) return idleEnvelope();
     env.room_code = code;
     if (!row) {
-      const live = store?.activeGame?.(sourceId);
       env.summary = {
         ok: false,
         message:
@@ -2300,18 +2446,16 @@ export async function historyReply(text, sourceId, store = null) {
     return env;
   }
 
-  const rows = await listRounds(sourceId, 5).catch(() => []);
-  if (!rows.length) {
-    const live = store?.activeGame?.(sourceId);
+  if (!golfChat) return idleEnvelope(); // no game, no rounds: not a golf chat
+  if (!recent.length) {
+    // a golf chat with no finished round yet = a game is being played right now
     env.summary = {
       ok: false,
-      message: live
-        ? `ยังไม่มีรอบที่จบในกลุ่มนี้ครับ\n(ห้องที่กำลังเล่นอยู่: ${live.room_code})`
-        : `ยังไม่มีประวัติการแข่งของกลุ่มนี้ครับ`,
+      message: `ยังไม่มีรอบที่จบในกลุ่มนี้ครับ\n(ห้องที่กำลังเล่นอยู่: ${live.room_code})`,
     };
     return env;
   }
-  env.summary = { ok: true, rounds: rows, message: formatRoundList(rows) };
+  env.summary = { ok: true, rounds: recent, message: formatRoundList(recent) };
   return env;
 }
 

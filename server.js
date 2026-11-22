@@ -5,8 +5,8 @@
 
 import express from "express";
 import { GameStore, SESSION_TTL_MS } from "./gameStore.js";
-import { dispatchAsync, welcomeMessage, isIdle } from "./session.js";
-import { verifySignature, replyJson, replyText } from "./line.js";
+import { dispatchAsync, isIdle } from "./session.js";
+import { verifySignature, replyJson } from "./line.js";
 import { initDb, dbEnabled, dbLastError, findRound, listRounds } from "./db.js";
 import {
   normalizeRoomCode,
@@ -206,14 +206,12 @@ export function ready() {
 
 export async function processEvent(ev) {
   await ready(); // never serve a webhook from a half-loaded store
-  // Bot added to a group/room, or a user adds the bot as a friend -> greet (Thai).
-  if ((ev.type === "join" || ev.type === "follow") && ev.replyToken) {
-    return replyText(ev.replyToken, welcomeMessage(), ACCESS_TOKEN);
-  }
-  // New member(s) joined a group the bot is in -> greet.
-  if (ev.type === "memberJoined" && ev.replyToken) {
-    return replyText(ev.replyToken, welcomeMessage(), ACCESS_TOKEN);
-  }
+  // No greeting — ever. The OA (@swinghouse) is also the shop's booking chat:
+  // customers add it as a friend to book a sim room, and a golf-bot welcome
+  // there is noise. Being added as a friend ("follow"), invited into a group
+  // ("join") or someone joining a group the bot is in ("memberJoined") gets no
+  // reply. The bot speaks only once somebody types "สร้างเกม".
+  if (ev.type === "follow" || ev.type === "join" || ev.type === "memberJoined") return;
 
   if (ev.type !== "message" || !ev.replyToken) return;
   const sourceId = sourceIdOf(ev.source);
